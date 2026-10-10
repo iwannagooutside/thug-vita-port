@@ -41,11 +41,13 @@
 #include <psp2/kernel/processmgr.h>
 
 #include <string.h>
+#include <stdio.h>
 
 #include "vita_log.h"
 namespace NxVita { extern float g_vita_plan_loin; extern int g_vita_cam_modeles; extern float g_vita_ombre_douce; extern int g_vita_ombre_decoupe; extern int g_vita_ombre_region; }
 #include "vita_dbgsrv.h"
-namespace Sfx { void VitaListeVoix( void ); }	// "voix" (#57)
+namespace Sfx { void VitaListeVoix( void ); void VitaEnregistreMix( int ); }
+namespace NxVita { extern bool g_vita_fond_violet; }	// "violet" (#18)	// "voix" (#57)
 extern int g_vita_trace_trk;	// trickcomponent.cpp, "trk" (#6)
 
 #include <sk/modules/skate/skate.h>
@@ -70,6 +72,7 @@ namespace Nx { extern int g_vita_mbf; extern int g_vita_zw_peau; }
 namespace NxVita { extern bool g_vita_alpha_fixe_une; }	// issue #72
 namespace NxVita { extern bool g_vita_env_x; }	// issue #72, passes 2-3 en reflet
 namespace NxVita { extern bool g_vita_zeq; }	// test de profondeur du decor (LEQUAL)
+namespace NxVita { extern int g_vita_cadence; }	// p_nx.cpp, FixerCadence ("framerate")
 namespace NxVita { extern int g_vita_mx2; void JournaliserTextes( void ); }
 namespace NxVita { extern int g_vita_sprites_sans_tex; }
 namespace Nx { extern bool g_vita_rigide_gpu; }	// "rgp" (#67)
@@ -328,6 +331,186 @@ static void ecran_raccourcis( void )
 }
 
 int g_vita_inv_gachettes = 1;	// #59/#60 : L/R = L2/R2, pave arriere = L1/R1
+
+// --- REGLAGES MANETTE DU PORT (#31, #2, #21) --------------------------------
+//
+// Le jeu d'origine n'a AUCUNE option d'inversion des sticks (verifie : ni le
+// C++ -- seul Gunslinger, absent de THUG, lit "GunslingerInvertAiming" -- ni
+// le menu CONTROL SETUP de gamemenu.qb : Vibration, Autokick, 180 Spin Taps,
+// No Reverts/Manuals/Walking). Les axes eux-memes sont conformes a XBox :
+// XBox/p_siodev.cpp:281-284 rend X droite = 255 et Y haut = 0 (sThumbY nie),
+// sceCtrl rend la meme chose. L'inversion est donc une PREFERENCE, pas un
+// correctif.
+//
+// Fichier texte cle=valeur, lu une fois au demarrage, build public compris
+// (inject.txt et le serveur de debug y sont coupes). Absent : on l'ecrit avec
+// les valeurs par defaut, pour que le joueur le trouve et l'edite en FTP ou
+// dans VitaShell. Commande de dev "ctl" : relecture sans relancer le jeu.
+//
+// Menu en jeu : OPTIONS > Control Setup > Vita Options (vita/qb/vita_options.q,
+// Sk/Scripting/Vita/vita_qb_options.cpp). Chaque bascule applique tout de
+// suite et REECRIT le fichier (reglages_ecrire : modele ci-dessous, les
+// commentaires ajoutes a la main par le joueur sont perdus). La cle
+// "framerate" (30/60, = commande de dev "fps") vit dans le meme fichier :
+// un seul fichier de reglages du port, nom inchange pour les installations
+// existantes.
+#define CONTROLS_PATH	"ux0:data/thug/controls.txt"
+
+static bool s_inv_lx = false, s_inv_ly = false;
+static bool s_inv_rx = false, s_inv_ry = false;
+
+// Modele du fichier ecrit (absent au demarrage, ou bascule depuis le menu) :
+// sept %d, dans l'ordre de reglages_ecrire.
+static const char s_controls_modele[] =
+	"# THUG Vita - port settings, read when the game starts.\n"
+	"# Also editable in game: OPTIONS > Control Setup > Vita Options.\n"
+	"# 0 = off, 1 = on. Delete this file to restore the defaults.\n"
+	"#\n"
+	"# Invert a stick axis. Left stick = skater (and menus), right stick = camera.\n"
+	"invert_left_x=%d\n"
+	"invert_left_y=%d\n"
+	"invert_right_x=%d\n"
+	"invert_right_y=%d\n"
+	"#\n"
+	"# 1: L/R buttons are L2/R2 (nollie, revert), spins L1/R1 are on the touch\n"
+	"#    surface below. 0: L/R buttons are L1/R1, L2/R2 are on the touch surface.\n"
+	"triggers_as_l2r2=%d\n"
+	"#\n"
+	"# 0: touch buttons are the bottom corners of the front touchscreen\n"
+	"#    (both corners = L1+R1, get off the board).\n"
+	"# 1: touch buttons are the rear touchpad, left half / right half.\n"
+	"touch_on_rear_pad=%d\n"
+	"#\n"
+	"# Display frame rate cap: 60, or 30 (steadier: every frame lasts 2 vsyncs).\n"
+	"framerate=%d\n";
+
+static bool s_reglages_lus_une_fois = false;
+
+static bool reglages_ecrire( void )
+{
+	char buf[2048];
+	const int n = snprintf( buf, sizeof( buf ), s_controls_modele,
+	                        s_inv_lx ? 1 : 0, s_inv_ly ? 1 : 0,
+	                        s_inv_rx ? 1 : 0, s_inv_ry ? 1 : 0,
+	                        g_vita_inv_gachettes ? 1 : 0,
+	                        g_vita_tactile ? 0 : 1,
+	                        ( NxVita::g_vita_cadence == 30 ) ? 30 : 60 );
+	if(( n <= 0 ) || ( n >= (int)sizeof( buf )))
+		return false;
+	SceUID fd = sceIoOpen( CONTROLS_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777 );
+	if( fd < 0 )
+		return false;
+	const int ecrit = sceIoWrite( fd, buf, n );
+	sceIoClose( fd );
+	return ( ecrit == n );
+}
+
+static void reglages_appliquer( const char *p_cle, int v )
+{
+	if( strcmp( p_cle, "invert_left_x" ) == 0 )				s_inv_lx = ( v != 0 );
+	else if( strcmp( p_cle, "invert_left_y" ) == 0 )		s_inv_ly = ( v != 0 );
+	else if( strcmp( p_cle, "invert_right_x" ) == 0 )		s_inv_rx = ( v != 0 );
+	else if( strcmp( p_cle, "invert_right_y" ) == 0 )		s_inv_ry = ( v != 0 );
+	else if( strcmp( p_cle, "triggers_as_l2r2" ) == 0 )		g_vita_inv_gachettes = ( v != 0 );
+	else if( strcmp( p_cle, "touch_on_rear_pad" ) == 0 )	g_vita_tactile = ( v == 0 );
+	else if( strcmp( p_cle, "framerate" ) == 0 )			NxVita::FixerCadence(( v == 30 ) ? 30 : 60 );
+	else VLOG( "PAD", "controls.txt : cle inconnue '%s'", p_cle );
+}
+
+static void reglages_lire( void )
+{
+	s_reglages_lus_une_fois = true;
+	SceUID fd = sceIoOpen( CONTROLS_PATH, SCE_O_RDONLY, 0777 );
+	if( fd < 0 )
+	{
+		const bool ok = reglages_ecrire();
+		VLOG( "PAD", "controls.txt absent : ecrit avec les valeurs par defaut (%s)",
+		      ok ? "ok" : "echec" );
+		return;		// les valeurs du fichier ecrit sont celles du code
+	}
+	char buf[2048];
+	const int n = sceIoRead( fd, buf, sizeof( buf ) - 1 );
+	sceIoClose( fd );
+	if( n <= 0 )
+		return;
+	buf[n] = 0;
+
+	// Lignes "cle=valeur" ; '#' commente jusqu'a la fin de ligne ; espaces et
+	// fins de ligne CRLF (Bloc-notes Windows) toleres.
+	char *p = buf;
+	while( *p )
+	{
+		char *fin = p;
+		while( *fin && *fin != '\n' )
+			++fin;
+		const bool derniere = ( *fin == 0 );
+		*fin = 0;
+		char *diese = strchr( p, '#' );
+		if( diese )
+			*diese = 0;
+		char *egal = strchr( p, '=' );
+		if( egal )
+		{
+			*egal = 0;
+			char *cle = p;
+			while( *cle == ' ' || *cle == '\t' )
+				++cle;
+			char *q = egal;
+			while(( q > cle ) && ( q[-1] == ' ' || q[-1] == '\t' ))
+				*--q = 0;
+			if( *cle )
+				reglages_appliquer( cle, atoi( egal + 1 ));
+		}
+		if( derniere )
+			break;
+		p = fin + 1;
+	}
+	VLOG( "PAD", "controls.txt : inversion lx=%d ly=%d rx=%d ry=%d, L/R=%s, tactile=%s, %d images/s",
+	      s_inv_lx, s_inv_ly, s_inv_rx, s_inv_ry,
+	      g_vita_inv_gachettes ? "L2/R2" : "L1/R1",
+	      g_vita_tactile ? "coins avant" : "pave arriere",
+	      ( NxVita::g_vita_cadence == 30 ) ? 30 : 60 );
+}
+
+// --- API du menu VITA OPTIONS (Sk/Scripting/Vita/vita_qb_options.cpp) -----
+// Valeurs telles qu'ecrites dans controls.txt : 0/1, framerate 30/60.
+// -1 : cle inconnue.
+int VitaReglageValeur( const char *p_cle )
+{
+	if( !s_reglages_lus_une_fois )
+		reglages_lire();
+	if( strcmp( p_cle, "invert_left_x" ) == 0 )		return s_inv_lx ? 1 : 0;
+	if( strcmp( p_cle, "invert_left_y" ) == 0 )		return s_inv_ly ? 1 : 0;
+	if( strcmp( p_cle, "invert_right_x" ) == 0 )	return s_inv_rx ? 1 : 0;
+	if( strcmp( p_cle, "invert_right_y" ) == 0 )	return s_inv_ry ? 1 : 0;
+	if( strcmp( p_cle, "triggers_as_l2r2" ) == 0 )	return g_vita_inv_gachettes ? 1 : 0;
+	if( strcmp( p_cle, "touch_on_rear_pad" ) == 0 )	return g_vita_tactile ? 0 : 1;
+	if( strcmp( p_cle, "framerate" ) == 0 )			return ( NxVita::g_vita_cadence == 30 ) ? 30 : 60;
+	return -1;
+}
+
+// Bascule entre les deux valeurs, applique tout de suite (memes chemins que
+// la lecture du fichier) et reecrit controls.txt. Rend la nouvelle valeur,
+// -1 si la cle est inconnue.
+int VitaReglageBasculer( const char *p_cle )
+{
+	const int v = VitaReglageValeur( p_cle );
+	if( v < 0 )
+		return -1;
+	const int nv = ( strcmp( p_cle, "framerate" ) == 0 ) ? (( v == 30 ) ? 60 : 30 ) : !v;
+	reglages_appliquer( p_cle, nv );
+	const bool ok = reglages_ecrire();
+	VLOG( "PAD", "Vita Options : %s = %d (controls.txt %s)", p_cle, nv, ok ? "ecrit" : "NON ECRIT" );
+	return VitaReglageValeur( p_cle );
+}
+
+// Symetrie autour du centre PS2 (128) : 0 -> 255 (256 plafonne), 128 -> 128,
+// 255 -> 1. Le repos de cette console (127/123) reste dans la zone morte.
+static unsigned char inverser_axe( unsigned char v )
+{
+	const int r = 256 - (int)v;
+	return (unsigned char)(( r > 255 ) ? 255 : r );
+}
 
 static unsigned int nom_vers_bouton( const char *p_mot )
 {
@@ -1209,11 +1392,40 @@ static void injection_analyser( char *buf )
 			p = (char *)q;
 			continue;
 		}
+		// "violet 0/1" : fond d'effacement violet de diagnostic (#18 ; defaut =
+		// gris-bleu XBox 0x506070).
+		else if( strncmp( p, "violet", 6 ) == 0 )
+		{
+			const char *q = p + 6;
+			while( *q == ' ' ) ++q;
+			NxVita::g_vita_fond_violet = ( atoi( q ) != 0 );
+			VLOG( "GFX", "fond violet de diagnostic : %d", (int)NxVita::g_vita_fond_violet );
+			while( *q && *q != ' ' && *q != '\n' && *q != '\r' ) ++q;
+			p = (char *)q;
+			continue;
+		}
 		// "voix" : voix sonores actives, nom et age (#57).
 		else if( strncmp( p, "voix", 4 ) == 0 )
 		{
 			Sfx::VitaListeVoix();
 			p += 4;
+			continue;
+		}
+		// "mix N" : enregistre N s de la sortie des effets (#30).
+		else if( strncmp( p, "mix", 3 ) == 0 )
+		{
+			const char *q = p + 3;
+			while( *q == ' ' ) ++q;
+			Sfx::VitaEnregistreMix( atoi( q ));
+			while( *q && *q != ' ' && *q != '\n' && *q != '\r' ) ++q;
+			p = (char *)q;
+			continue;
+		}
+		// "ctl" : relit ux0:data/thug/controls.txt (#31).
+		else if( strncmp( p, "ctl", 3 ) == 0 )
+		{
+			reglages_lire();
+			p += 3;
 			continue;
 		}
 		// "tac 0/1" : L1/R1 aux coins bas de l'ecran avant, les deux = descente (#76).
@@ -2443,6 +2655,15 @@ Device::Device( int index, int port, int slot )
 	// Mode analogique large : sans cet appel, les sticks restent centres et
 	// le skater ne bougera jamais. C'est le piege classique de sceCtrl.
 	sceCtrlSetSamplingMode( SCE_CTRL_MODE_ANALOG_WIDE );
+
+	// Reglages du port (#31) : une seule lecture, quel que soit le nombre de
+	// Device crees (un par port/slot).
+	static bool s_reglages_lus = false;
+	if( !s_reglages_lus )
+	{
+		s_reglages_lus = true;
+		reglages_lire();
+	}
 }
 
 
@@ -2530,6 +2751,13 @@ void Device::read_data( void )
 		m_plugged_in   = false;
 		return;
 	}
+
+	// Inversion des axes choisie par le joueur (#31). Sur le MATERIEL
+	// seulement, avant l'injection : "hold ly=-1" de vctl.py reste absolu.
+	if( s_inv_lx ) pad.lx = inverser_axe( pad.lx );
+	if( s_inv_ly ) pad.ly = inverser_axe( pad.ly );
+	if( s_inv_rx ) pad.rx = inverser_axe( pad.rx );
+	if( s_inv_ry ) pad.ry = inverser_axe( pad.ry );
 
 	if( !g_vita_tactile )
 		pad.buttons |= pave_arriere();

@@ -30,17 +30,19 @@
 **  4 octets d'en-tête (prédicteur int16, index de pas uint8, un octet       **
 **  réservé) puis les données par groupes de 4 octets alternant les canaux.  **
 **                                                                          **
-**  PORTÉE DE CE LOT : la musique (music_pcm.wad). Les flux de voix          **
-**  (pcm.wad) partagent exactement le même format et réutiliseront ce        **
-**  décodeur ; ils restent neutralisés ici, avec les mêmes valeurs de repli  **
-**  qu'avant — « c'est parti » / « rien en cours » — pour que le moteur      **
-**  n'attende jamais un flux qui ne démarrera pas.                           **
+**  VOIX (issue #20) : les flux de pcm.wad -- dialogues de mission,       **
+**  donneurs d'objectifs -- sont joues par le bloc "Flux de voix" plus     **
+**  bas, avec le meme decodeur (mono, blockAlign 36, 11025..48000 Hz).     **
+**  Les cinematiques n'en dependent pas : leur son passe par la piste     **
+**  musique (PreLoadMusicStream).                                         **
 *****************************************************************************/
 
 #include <core/defines.h>
 #include <gel/music/Vita/p_music.h>
 #include <core/crc.h>
 #include <core/Vita/adpcm.h>
+#include <core/macros.h>
+#include <gel/soundfx/soundfx.h>
 
 #include <psp2/audioout.h>
 #include <psp2/kernel/threadmgr.h>
@@ -114,12 +116,18 @@ static uint32	s_pos_debut			= 0;	/* offset des données dans le .wad */
 static uint32	s_pos_taille		= 0;	/* octets de données ADPCM */
 static uint32	s_pos_lue			= 0;	/* octets déjà consommés */
 
-static float	s_volume			= 1.0f;
+static float	s_volume			= 50.0f;	// pourcentage 0..100 (DEFAULT_MUSIC_VOLUME)
 
 // Tampons. Alloués une fois : allouer dans le thread audio à chaque tour
 // fragmenterait le tas pendant le jeu.
 static unsigned char	*s_lecture	= NULL;
-static short			*s_sortie	= NULL;
+// DOUBLE TAMPON (#30) : sceAudioOutOutput ne copie pas le tampon, la Vita le
+// lit PENDANT qu'il joue. Recalculer le grain suivant dans le meme tampon
+// ecrasait le son en cours de lecture -- le craquement entendu sur console
+// alors que l'enregistrement du melange (pris avant l'envoi) etait propre.
+// On alterne entre deux moities, comme le pilote audio Vita de SDL.
+static short			*s_sortie	= NULL;	// moitie en cours de decodage
+static short			*s_sortie_base	= NULL;	// deux grains
 
 // Le decodeur vit dans Core/Vita/adpcm.cpp : les effets sonores utilisent
 // exactement le meme format (mono, blockAlign 36, au lieu de stereo 72), et
@@ -331,6 +339,8 @@ static int thread_audio( SceSize, void * )
 			}
 
 			sceAudioOutOutput( s_port, s_sortie );
+			s_sortie = ( s_sortie == s_sortie_base )
+			           ? s_sortie_base + GRAIN * AUDIO_CANAUX : s_sortie_base;
 			bloc += n;
 
 			if( s_pause || !s_joue )
@@ -344,7 +354,7 @@ static void applique_volume( void )
 {
 	if( s_port < 0 )
 		return;
-	int v = (int)( s_volume * SCE_AUDIO_VOLUME_0DB );
+	int v = (int)( s_volume * 0.01f * SCE_AUDIO_VOLUME_0DB );	// pourcentage, comme Xbox (p_adpcmfilestream.cpp:767)
 	if( v < 0 )						v = 0;
 	if( v > SCE_AUDIO_VOLUME_0DB )	v = SCE_AUDIO_VOLUME_0DB;
 	int vols[2] = { v, v };
@@ -419,11 +429,579 @@ static bool demarre( uint32 checksum )
 } // namespace anonyme
 
 // ---------------------------------------------------------------------------
+// Flux de voix : data/streams/pcm/pcm.wad (issue #20)
+// ---------------------------------------------------------------------------
+//
+// Les dialogues de mission (donneurs d'objectifs, Eric, les pros...) passent
+// par ce chemin, PAS par la musique :
+//
+//   CGoalPed::PlayGoalStream (Sk/Modules/Skate/GoalPed.cpp:400) commence par
+//   Pcm::StreamExists -> PCMAudio_FindNameFromChecksum (music.cpp:2277). Ce
+//   stub rendait 0 : le moteur concluait que la voix n'existait pas et ne
+//   tentait meme pas de la jouer. Derriere, PreLoadStream / goal_play_stream
+//   (goal_utilities.qb : boucle sur PreLoadStreamDone puis
+//   StartPreloadedStream volume=190) tombaient sur des stubs muets.
+//
+//   Les cinematiques, elles, ont leur voix parce qu'elles passent par
+//   Pcm::PreLoadMusicStream (Sk/Objects/cutscenedetails.cpp:4157) : la piste
+//   "musique" de music_pcm.wad, implementee plus haut.
+//
+// Contrat suivi : Gel/Music/Xbox/p_music.cpp (PlayStream:1266,
+// PreLoadStream:740, GetStreamStatus:882, FindNameFromChecksum:1019,
+// SetStreamVolume:1035). Pitch ignore, comme sur Xbox (SetStreamPitch:1105).
+//
+// [VERIFIE] sur table, avant d'ecrire ce code : pcm.dat = 4 + 2385*12 octets,
+// meme structure que music_pcm.dat, mais NON trie (le tri est obligatoire,
+// Xbox le fait a l'init, p_music.cpp:575). Les 2385 entrees sont des RIFF
+// Xbox ADPCM MONO, blockAlign 36, fmt puis data (donnees a l'octet 48) ;
+// frequences : 44100 Hz (2352), 48000 (30), 22050 (2), 11025 (1). On
+// reechantillonne donc vers 48000 en virgule fixe 16.16.
+//
+// Architecture : un thread et UN port audio (VOICE, repli MAIN) melangent les
+// NUM_STREAMS canaux. Les lectures disque se font dans ce thread, HORS verrou,
+// par sceIoPread (pas de position partagee a proteger) ; un numero de
+// generation par canal jette une lecture devenue caduque si le thread
+// principal a arrete/relance le canal pendant ce temps.
+
+namespace
+{
+
+#define VOIX_HZ				48000
+#define VOIX_GRAIN_MAX		1024
+// Lecture par paquets de 455 blocs de 36 octets = 16380 octets, ~0,37 s a
+// 44100 Hz. On recharge quand il reste moins de VOIX_SEUIL octets : un grain
+// de 1024 echantillons a 48000 Hz consomme au plus 16 blocs = 576 octets.
+#define VOIX_LECTURE		16380
+#define VOIX_SEUIL			4096
+#define VOIX_TAMPON			( VOIX_LECTURE + VOIX_SEUIL )
+
+static const char *CHEMIN_VOIX_DAT = "ux0:data/thug/Data/streams/pcm/pcm.dat";
+static const char *CHEMIN_VOIX_WAD = "ux0:data/thug/Data/streams/pcm/pcm.wad";
+
+struct SCanalVoix
+{
+	// Etat vu par le thread principal (music.cpp) : actif <=> pas FREE.
+	volatile bool	actif;
+	volatile bool	ok_jouer;		// faux tant qu'un PreLoad n'est pas lance
+	volatile bool	pause;
+	volatile bool	pret;			// premier paquet lu (ou fin atteinte)
+	uint32			generation;
+	uint32			checksum;
+
+	// Position dans pcm.wad.
+	uint32			debut;			// offset des donnees ADPCM
+	uint32			taille;			// octets de donnees
+	uint32			lu;				// octets deja lus du disque
+	int				bloc;			// blockAlign (36)
+	int				ech_bloc;		// echantillons par bloc (64)
+
+	// Tampon brut : ecrit par le seul thread de melange.
+	unsigned char	*p_brut;
+	int				brut_octets;
+	int				brut_pos;
+
+	// Bloc decode et reechantillonnage.
+	short			pcm[64];
+	int				pcm_n;
+	int				pcm_pos;
+	unsigned int	pas;			// 16.16, frequence source / 48000
+	unsigned int	frac;
+	int				e0, e1;			// interpolation lineaire entre e0 et e1
+	bool			fin_donnees;
+
+	int				vol_g;			// 0..256
+	int				vol_d;
+};
+
+static SEntree		*s_voix_index		= NULL;
+static int			 s_voix_index_nb	= 0;
+static SceUID		 s_voix_wad			= -1;
+static int			 s_voix_port		= -1;
+static int			 s_voix_grain		= 512;
+static SceUID		 s_voix_thread		= -1;
+static SceUID		 s_voix_mutex		= -1;
+static volatile bool s_voix_tourne		= false;
+static short		*s_voix_sortie		= NULL;	// double tampon, voir s_sortie
+static short		*s_voix_sortie_base	= NULL;
+static SCanalVoix	 s_canal[NUM_STREAMS];
+
+static inline void verrouille_voix( void )
+{
+	if( s_voix_mutex >= 0 )
+		sceKernelLockMutex( s_voix_mutex, 1, NULL );
+}
+
+static inline void deverrouille_voix( void )
+{
+	if( s_voix_mutex >= 0 )
+		sceKernelUnlockMutex( s_voix_mutex, 1 );
+}
+
+static const SEntree *trouve_voix( uint32 checksum )
+{
+	int lo = 0, hi = s_voix_index_nb - 1;
+	while( lo <= hi )
+	{
+		const int mid = ( lo + hi ) / 2;
+		if( s_voix_index[mid].checksum == checksum )	return &s_voix_index[mid];
+		if( s_voix_index[mid].checksum <  checksum )	lo = mid + 1;
+		else											hi = mid - 1;
+	}
+	return NULL;
+}
+
+static bool charge_index_voix( void )
+{
+	SceUID f = sceIoOpen( CHEMIN_VOIX_DAT, SCE_O_RDONLY, 0 );
+	if( f < 0 )
+	{
+		VLOG( "PCM", "index des voix introuvable : %s", CHEMIN_VOIX_DAT );
+		return false;
+	}
+
+	uint32 nb = 0;
+	if(( sceIoRead( f, &nb, 4 ) != 4 ) || ( nb == 0 ) || ( nb > 100000 ))
+	{
+		VLOG( "PCM", "index des voix : en-tete invalide (%u)", nb );
+		sceIoClose( f );
+		return false;
+	}
+
+	s_voix_index = (SEntree *)malloc( nb * sizeof( SEntree ));
+	if( !s_voix_index )
+	{
+		sceIoClose( f );
+		return false;
+	}
+
+	const int voulu = (int)( nb * sizeof( SEntree ));
+	const int lu    = sceIoRead( f, s_voix_index, voulu );
+	sceIoClose( f );
+	if( lu != voulu )
+	{
+		VLOG( "PCM", "index des voix tronque : %d octets sur %d", lu, voulu );
+		free( s_voix_index );
+		s_voix_index = NULL;
+		return false;
+	}
+
+	// pcm.dat n'est PAS trie sur l'ISO (verifie) : sans ce tri, la recherche
+	// binaire manquerait la plupart des voix, sans le moindre message.
+	s_voix_index_nb = (int)nb;
+	qsort( s_voix_index, s_voix_index_nb, sizeof( SEntree ), cmp_entree );
+	return true;
+}
+
+// Lit l'en-tete RIFF de l'entree. On parcourt les blocs au lieu de supposer
+// "data" a l'octet 48 : c'est le cas des 2385 entrees de l'ISO USA, mais un
+// bloc supplementaire (bext...) a deja piege les effets sonores.
+static bool lit_entete_voix( const SEntree *p_e, uint32 *p_debut, uint32 *p_taille,
+                             uint32 *p_hz, int *p_bloc )
+{
+	unsigned char h[128];
+	if( sceIoPread( s_voix_wad, h, sizeof( h ), p_e->offset ) != (int)sizeof( h ))
+		return false;
+	if(( memcmp( h, "RIFF", 4 ) != 0 ) || ( memcmp( h + 8, "WAVE", 4 ) != 0 ))
+		return false;
+
+	bool fmt_ok = false;
+	uint32 p = 12;
+	while( p + 8 <= sizeof( h ))
+	{
+		uint32 lg;
+		memcpy( &lg, h + p + 4, 4 );
+		if( memcmp( h + p, "fmt ", 4 ) == 0 )
+		{
+			if( p + 8 + 16 > sizeof( h ))
+				return false;
+			const uint16 tag    = (uint16)( h[p + 8]  | ( h[p + 9]  << 8 ));
+			const uint16 canaux = (uint16)( h[p + 10] | ( h[p + 11] << 8 ));
+			uint32 hz;
+			memcpy( &hz, h + p + 12, 4 );
+			const uint16 bloc   = (uint16)( h[p + 20] | ( h[p + 21] << 8 ));
+			if(( tag != 0x0069 ) || ( canaux != 1 ) || ( bloc != 36 ) ||
+			   ( hz < 8000 ) || ( hz > VOIX_HZ ))
+			{
+				VLOG( "PCM", "voix %08x : format non gere (tag 0x%04x, %u canaux, %u Hz, bloc %u)",
+				      p_e->checksum, tag, canaux, hz, bloc );
+				return false;
+			}
+			*p_hz   = hz;
+			*p_bloc = bloc;
+			fmt_ok  = true;
+		}
+		else if( memcmp( h + p, "data", 4 ) == 0 )
+		{
+			if( !fmt_ok )
+				return false;
+			const uint32 dispo = ( p_e->taille > p + 8 ) ? ( p_e->taille - ( p + 8 )) : 0;
+			*p_debut  = p_e->offset + p + 8;
+			*p_taille = ( lg < dispo ) ? lg : dispo;
+			return true;
+		}
+		p += 8 + lg + ( lg & 1 );
+	}
+	return false;
+}
+
+// Volumes du moteur (pourcentages, signe = phase PS2) -> 0..256, multiplies
+// par le volume general des effets comme sur Xbox (PERCENT( GetMainVolume,
+// canal ), p_music.cpp:1046). Xbox plafonne a 0 dB (DSBVOLUME_MAX) : le
+// "volume = 190" de goal_play_stream revient donc au plein volume.
+static void volumes_voix( float g, float d, int *p_g, int *p_d )
+{
+	if( g < 0.0f )	g = -g;
+	if( d < 0.0f )	d = -d;
+
+	float general = 100.0f;
+	Sfx::CSfxManager *p_sfx = Sfx::CSfxManager::Instance();
+	if( p_sfx )
+		general = p_sfx->GetMainVolume();
+
+	g = PERCENT( general, g );
+	d = PERCENT( general, d );
+	if( g > 100.0f )	g = 100.0f;
+	if( d > 100.0f )	d = 100.0f;
+
+	*p_g = (int)( g * 2.56f );
+	*p_d = (int)( d * 2.56f );
+}
+
+// Echantillon source suivant. Rend false a la fin des donnees, ou si le
+// tampon brut est vide (lecture en retard : le grain se termine en silence).
+static bool echantillon_suivant( SCanalVoix *p_c, int *p_e )
+{
+	if( p_c->pcm_pos >= p_c->pcm_n )
+	{
+		if( p_c->brut_octets - p_c->brut_pos < p_c->bloc )
+		{
+			if( p_c->lu >= p_c->taille )
+				p_c->fin_donnees = true;
+			return false;
+		}
+		VitaAdpcm::DecodeBloc( p_c->p_brut + p_c->brut_pos, p_c->pcm, 1, p_c->bloc );
+		p_c->brut_pos += p_c->bloc;
+		p_c->pcm_n     = p_c->ech_bloc;
+		p_c->pcm_pos   = 0;
+	}
+	*p_e = p_c->pcm[p_c->pcm_pos++];
+	return true;
+}
+
+// Recharge le tampon brut du canal si besoin. Appele par le thread de
+// melange uniquement ; le disque est lu verrou RELACHE.
+static void recharge_canal( int i )
+{
+	SCanalVoix *p_c = &s_canal[i];
+
+	verrouille_voix();
+	if( !p_c->actif || ( p_c->lu >= p_c->taille ) ||
+	    ( p_c->brut_octets - p_c->brut_pos >= VOIX_SEUIL ))
+	{
+		deverrouille_voix();
+		return;
+	}
+
+	// Le reste non consomme passe en tete, la lecture se fait a la suite.
+	const int reste = p_c->brut_octets - p_c->brut_pos;
+	if(( reste > 0 ) && ( p_c->brut_pos > 0 ))
+		memmove( p_c->p_brut, p_c->p_brut + p_c->brut_pos, reste );
+	p_c->brut_octets = reste;
+	p_c->brut_pos    = 0;
+
+	uint32 a_lire = VOIX_TAMPON - reste;
+	a_lire -= a_lire % p_c->bloc;
+	if( a_lire > p_c->taille - p_c->lu )
+		a_lire = p_c->taille - p_c->lu;
+
+	const uint32 gen    = p_c->generation;
+	const uint32 offset = p_c->debut + p_c->lu;
+	unsigned char *p_dst = p_c->p_brut + reste;
+	deverrouille_voix();
+
+	const int lu = sceIoPread( s_voix_wad, p_dst, a_lire, offset );
+
+	verrouille_voix();
+	if( p_c->actif && ( p_c->generation == gen ))
+	{
+		if( lu > 0 )
+		{
+			p_c->brut_octets += lu;
+			p_c->lu          += lu;
+		}
+		else
+		{
+			// Lecture en echec : on termine proprement le flux au lieu de
+			// laisser le moteur attendre une voix qui ne viendra plus.
+			VLOG( "PCM", "voix %08x : lecture en echec (0x%08x), flux arrete", p_c->checksum, lu );
+			p_c->taille = p_c->lu;
+		}
+		p_c->pret = true;
+	}
+	deverrouille_voix();
+}
+
+static int thread_voix( SceSize, void * )
+{
+	static int accu[VOIX_GRAIN_MAX * 2];
+
+	while( s_voix_tourne )
+	{
+		for( int i = 0; i < NUM_STREAMS; ++i )
+			recharge_canal( i );
+
+		const int grain = s_voix_grain;
+		bool quelque_chose = false;
+		memset( accu, 0, grain * 2 * sizeof( int ));
+
+		verrouille_voix();
+		for( int i = 0; i < NUM_STREAMS; ++i )
+		{
+			SCanalVoix *p_c = &s_canal[i];
+			if( !p_c->actif || !p_c->ok_jouer || p_c->pause )
+				continue;
+
+			quelque_chose = true;
+			for( int n = 0; n < grain; ++n )
+			{
+				const int e = p_c->e0 + ((( p_c->e1 - p_c->e0 ) * (int)( p_c->frac >> 1 )) >> 15 );
+				accu[n * 2    ] += ( e * p_c->vol_g ) >> 8;
+				accu[n * 2 + 1] += ( e * p_c->vol_d ) >> 8;
+
+				p_c->frac += p_c->pas;
+				bool manque = false;
+				while( p_c->frac >= 0x10000 )
+				{
+					int suivant;
+					if( !echantillon_suivant( p_c, &suivant ))
+					{
+						manque = true;
+						break;
+					}
+					p_c->frac -= 0x10000;
+					p_c->e0 = p_c->e1;
+					p_c->e1 = suivant;
+				}
+				if( manque )
+				{
+					// Pas de position perdue en cas de lecture en retard :
+					// on reprendra a ce point au grain suivant.
+					if( p_c->frac >= 0x10000 )
+						p_c->frac = 0x10000 - 1;
+					break;
+				}
+			}
+
+			if( p_c->fin_donnees )
+			{
+				p_c->actif = false;
+				VLOG( "PCM", "voix %08x terminee (canal %d)", p_c->checksum, i );
+			}
+		}
+		deverrouille_voix();
+
+		if( !quelque_chose )
+		{
+			sceKernelDelayThread( 5000 );
+			continue;
+		}
+
+		for( int n = 0; n < grain * 2; ++n )
+		{
+			int e = accu[n];
+			if( e >  32767 )	e =  32767;
+			if( e < -32768 )	e = -32768;
+			s_voix_sortie[n] = (short)e;
+		}
+		sceAudioOutOutput( s_voix_port, s_voix_sortie );
+		s_voix_sortie = ( s_voix_sortie == s_voix_sortie_base )
+		                ? s_voix_sortie_base + VOIX_GRAIN_MAX * 2 : s_voix_sortie_base;
+	}
+	return 0;
+}
+
+static void voix_init( void )
+{
+	if( !charge_index_voix() )
+	{
+		VLOG( "PCM", "pas de voix : index indisponible" );
+		return;
+	}
+
+	s_voix_wad = sceIoOpen( CHEMIN_VOIX_WAD, SCE_O_RDONLY, 0 );
+	if( s_voix_wad < 0 )
+	{
+		VLOG( "PCM", "pas de voix : %s introuvable", CHEMIN_VOIX_WAD );
+		free( s_voix_index );
+		s_voix_index    = NULL;
+		s_voix_index_nb = 0;
+		return;
+	}
+
+	bool alloc_ok = true;
+	s_voix_sortie_base = (short *)memalign( 64, 2 * VOIX_GRAIN_MAX * 2 * sizeof( short ));
+	s_voix_sortie = s_voix_sortie_base;
+	if( !s_voix_sortie )
+		alloc_ok = false;
+	for( int i = 0; i < NUM_STREAMS; ++i )
+	{
+		memset( &s_canal[i], 0, sizeof( SCanalVoix ));
+		s_canal[i].p_brut = (unsigned char *)malloc( VOIX_TAMPON );
+		if( !s_canal[i].p_brut )
+			alloc_ok = false;
+	}
+	if( !alloc_ok )
+	{
+		VLOG( "PCM", "pas de voix : allocation des tampons impossible" );
+		return;
+	}
+
+	// Un port a part : le port BGM est pris par la musique, et le melangeur
+	// des effets (Gel/SoundFX/Vita) a le sien. Le port VOICE est prevu pour
+	// la voix ; repli sur un port MAIN s'il est refuse.
+	const char *p_type = "VOICE";
+	s_voix_grain = VOIX_GRAIN_MAX;
+	s_voix_port  = sceAudioOutOpenPort( SCE_AUDIO_OUT_PORT_TYPE_VOICE, s_voix_grain,
+	                                    VOIX_HZ, SCE_AUDIO_OUT_MODE_STEREO );
+	if( s_voix_port < 0 )
+	{
+		VLOG( "PCM", "port VOICE refuse (0x%08x), repli sur MAIN", s_voix_port );
+		p_type       = "MAIN";
+		s_voix_grain = 512;		/* limite du port MAIN, cf. Gel/SoundFX/Vita */
+		s_voix_port  = sceAudioOutOpenPort( SCE_AUDIO_OUT_PORT_TYPE_MAIN, s_voix_grain,
+		                                    VOIX_HZ, SCE_AUDIO_OUT_MODE_STEREO );
+	}
+	if( s_voix_port < 0 )
+	{
+		VLOG( "PCM", "pas de voix : port audio refuse (0x%08x)", s_voix_port );
+		return;
+	}
+
+	s_voix_mutex  = sceKernelCreateMutex( "thug_voix", 0, 0, NULL );
+	s_voix_tourne = true;
+	s_voix_thread = sceKernelCreateThread( "thug_voix", thread_voix,
+	                                       0x10000100, 0x4000, 0, 0, NULL );
+	if( s_voix_thread >= 0 )
+		sceKernelStartThread( s_voix_thread, 0, NULL );
+	else
+	{
+		s_voix_tourne = false;
+		VLOG( "PCM", "pas de voix : thread refuse (0x%08x)", s_voix_thread );
+		return;
+	}
+
+	VLOG( "PCM", "voix pretes : %d flux, %d canaux, port %s grain %d",
+	      s_voix_index_nb, NUM_STREAMS, p_type, s_voix_grain );
+}
+
+static inline bool voix_dispo( void )
+{
+	return s_voix_tourne && ( s_voix_wad >= 0 ) && ( s_voix_index != NULL );
+}
+
+static inline bool canal_valide( int i )
+{
+	return ( i >= 0 ) && ( i < NUM_STREAMS );
+}
+
+static bool voix_demarre( uint32 checksum, int canal, float vol_g, float vol_d, bool preload )
+{
+	if( !voix_dispo() || !canal_valide( canal ))
+		return false;
+
+	const SEntree *p_e = trouve_voix( checksum );
+	if( !p_e )
+	{
+		VLOG( "PCM", "voix %08x absente de pcm.dat", checksum );
+		return false;
+	}
+
+	// Comme Xbox (p_music.cpp:1285) : un canal occupe n'est pas ecrase ici,
+	// music.cpp arrete d'abord le canal de plus basse priorite.
+	if( s_canal[canal].actif )
+		return false;
+
+	uint32 debut, taille, hz;
+	int bloc;
+	if( !lit_entete_voix( p_e, &debut, &taille, &hz, &bloc ))
+	{
+		VLOG( "PCM", "voix %08x : en-tete RIFF illisible", checksum );
+		return false;
+	}
+
+	int g, d;
+	volumes_voix( vol_g, vol_d, &g, &d );
+
+	verrouille_voix();
+	SCanalVoix *p_c = &s_canal[canal];
+	p_c->generation++;
+	p_c->checksum    = checksum;
+	p_c->debut       = debut;
+	p_c->taille      = taille;
+	p_c->lu          = 0;
+	p_c->bloc        = bloc;
+	p_c->ech_bloc    = VitaAdpcm::EchantillonsParBloc( bloc, 1 );
+	if( p_c->ech_bloc > 64 )
+		p_c->ech_bloc = 64;
+	p_c->brut_octets = 0;
+	p_c->brut_pos    = 0;
+	p_c->pcm_n       = 0;
+	p_c->pcm_pos     = 0;
+	p_c->pas         = (unsigned int)(((unsigned long long)hz << 16 ) / VOIX_HZ );
+	p_c->frac        = 0;
+	p_c->e0          = 0;
+	p_c->e1          = 0;
+	p_c->fin_donnees = false;
+	p_c->vol_g       = g;
+	p_c->vol_d       = d;
+	p_c->pause       = false;
+	p_c->pret        = ( taille == 0 );
+	p_c->ok_jouer    = !preload;
+	p_c->actif       = true;
+	deverrouille_voix();
+
+	VLOG( "PCM", "voix %08x canal %d : %u Hz, %u octets%s, volume %d/%d",
+	      checksum, canal, hz, taille, preload ? " (prechargee)" : "", g, d );
+	return true;
+}
+
+static void voix_volume( int canal, float vol_g, float vol_d )
+{
+	if( !canal_valide( canal ) || !s_canal[canal].actif )
+		return;
+	int g, d;
+	volumes_voix( vol_g, vol_d, &g, &d );
+	verrouille_voix();
+	s_canal[canal].vol_g = g;
+	s_canal[canal].vol_d = d;
+	deverrouille_voix();
+}
+
+static void voix_arrete( int canal )
+{
+	if( !canal_valide( canal ))
+		return;
+	verrouille_voix();
+	if( s_canal[canal].actif )
+	{
+		s_canal[canal].actif = false;
+		s_canal[canal].generation++;
+	}
+	deverrouille_voix();
+}
+
+} // namespace anonyme
+
+// ---------------------------------------------------------------------------
 // API attendue par Gel/Music/music.cpp
 // ---------------------------------------------------------------------------
 
 void	PCMAudio_Init( void )
 {
+	// Les voix d'abord : elles ne dependent pas de la musique, et le retour
+	// anticipe ci-dessous (index musique absent) ne doit pas les priver.
+	voix_init();
+
 	if( !charge_index() )
 	{
 		VLOG( "PCM", "pas de musique : index indisponible" );
@@ -441,7 +1019,8 @@ void	PCMAudio_Init( void )
 	}
 
 	s_lecture = (unsigned char *)malloc( TAILLE_LECTURE );
-	s_sortie  = (short *)malloc( GRAIN * AUDIO_CANAUX * sizeof( short ));
+	s_sortie_base = (short *)memalign( 64, 2 * GRAIN * AUDIO_CANAUX * sizeof( short ));
+	s_sortie  = s_sortie_base;
 	if( !s_lecture || !s_sortie )
 	{
 		VLOG( "PCM", "pas de musique : allocation des tampons impossible" );
@@ -516,9 +1095,25 @@ void	PCMAudio_StopMusic( bool )
 	deverrouille();
 }
 
-void	PCMAudio_Pause( bool pause, int )
+// Routage par canal comme Xbox (p_music.cpp:915). Avant les voix, ce stub
+// mettait la MUSIQUE en pause aussi pour Pcm::PauseStream (EXTRA_CHANNEL).
+void	PCMAudio_Pause( bool pause, int ch )
 {
-	s_pause = pause;
+	if( ch == MUSIC_CHANNEL )
+	{
+		s_pause = pause;
+		return;
+	}
+
+	// Seuls les flux en cours sont touches : un flux lance ensuite part non
+	// suspendu, comme un nouveau CADPCMFileStream sur Xbox.
+	verrouille_voix();
+	for( int s = 0; s < NUM_STREAMS; ++s )
+	{
+		if( s_canal[s].actif )
+			s_canal[s].pause = pause;
+	}
+	deverrouille_voix();
 }
 
 int		PCMAudio_SetMusicVolume( float volume )
@@ -536,14 +1131,9 @@ int		PCMAudio_GetMusicStatus( void )
 	return s_joue ? PCM_STATUS_RUNNING : PCM_STATUS_FREE;
 }
 
-// --- pistes nommées et flux de voix ----------------------------------------
-//
-// Non implémentés dans ce lot. Les valeurs rendues sont celles d'avant, et le
-// raisonnement est inchangé : dire « c'est parti » / « rien en cours » évite
-// que le moteur attende un flux qui ne démarrera jamais. pcm.wad partage le
-// format de music_pcm.wad ; le décodeur ci-dessus le lira tel quel.
+// --- pistes nommees ---------------------------------------------------------
 
-// Le chemin � musique � du moteur passe par des NOMS, pas par des checksums :
+// Le chemin "musique" du moteur passe par des NOMS, pas par des checksums :
 // music.cpp:1504 (AddTrackToPlaylist) et music.cpp:570 (PlayMusicTrack). Le nom
 // est converti avec le CRC du moteur, celui-la meme qui a servi a construire
 // l'index -- minuscules, '/' devenant '\\'.
@@ -560,26 +1150,114 @@ bool	PCMAudio_PlayMusicTrack( const char *p_nom, bool )
 }
 bool	PCMAudio_PlaySoundtrackMusicTrack( int, int )		{ return true; }
 
-bool	PCMAudio_PlayStream( uint32, int, float, float, float, bool )
-															{ return true; }
-bool	PCMAudio_PlayStream( uint32, int, Sfx::sVolume *, float, bool )
-															{ return true; }
+// --- flux de voix (pcm.wad) : voir le bloc "Flux de voix" plus haut ---------
 
-void	PCMAudio_StopStream( int, bool )					{}
-void	PCMAudio_StopStreams( void )						{}
+bool	PCMAudio_PlayStream( uint32 checksum, int whichStream, float volumeL, float volumeR,
+                             float, bool preload )
+{
+	return voix_demarre( checksum, whichStream, volumeL, volumeR, preload );
+}
 
-bool	PCMAudio_PreLoadStream( uint32, int )				{ return true; }
-bool	PCMAudio_PreLoadStreamDone( int )					{ return true; }
-bool	PCMAudio_StartPreLoadedStream( int, float, float, float )
-															{ return true; }
-bool	PCMAudio_StartPreLoadedStream( int, Sfx::sVolume *, float )
-															{ return true; }
+bool	PCMAudio_PlayStream( uint32 checksum, int whichStream, Sfx::sVolume *p_volume,
+                             float, bool preload )
+{
+	// Xbox passe NULL depuis PreLoadStream (p_music.cpp:746) : volume plein,
+	// StartPreLoadedStream fixera le vrai.
+	float g = 100.0f, d = 100.0f;
+	if( p_volume )
+	{
+		g = p_volume->GetChannelVolume( 0 );
+		d = p_volume->GetChannelVolume( 1 );
+	}
+	return voix_demarre( checksum, whichStream, g, d, preload );
+}
 
-bool	PCMAudio_SetStreamVolume( float, float, int )		{ return true; }
-bool	PCMAudio_SetStreamVolume( Sfx::sVolume *, int )		{ return true; }
+void	PCMAudio_StopStream( int whichStream, bool )
+{
+	voix_arrete( whichStream );
+}
+
+void	PCMAudio_StopStreams( void )
+{
+	for( int i = 0; i < NUM_STREAMS; ++i )
+		voix_arrete( i );
+}
+
+// Comme Xbox (p_music.cpp:740) : le flux est ouvert tout de suite, mais ne
+// joue qu'a StartPreLoadedStream. Le thread de melange lit le premier paquet
+// entre-temps ; PreLoadStreamDone le signale.
+bool	PCMAudio_PreLoadStream( uint32 checksum, int whichStream )
+{
+	return voix_demarre( checksum, whichStream, 100.0f, 100.0f, true );
+}
+
+bool	PCMAudio_PreLoadStreamDone( int whichStream )
+{
+	// Xbox rend true quand le canal n'a pas de flux (p_music.cpp:773).
+	if( !canal_valide( whichStream ) || !s_canal[whichStream].actif )
+		return true;
+	return s_canal[whichStream].pret;
+}
+
+static bool lance_prechargee( int whichStream, float g, float d )
+{
+	if( !canal_valide( whichStream ) || !s_canal[whichStream].actif )
+		return false;
+	voix_volume( whichStream, g, d );
+	verrouille_voix();
+	s_canal[whichStream].ok_jouer = true;
+	deverrouille_voix();
+	return true;
+}
+
+bool	PCMAudio_StartPreLoadedStream( int whichStream, float volumeL, float volumeR, float )
+{
+	return lance_prechargee( whichStream, volumeL, volumeR );
+}
+
+bool	PCMAudio_StartPreLoadedStream( int whichStream, Sfx::sVolume *p_volume, float )
+{
+	float g = 100.0f, d = 100.0f;
+	if( p_volume )
+	{
+		g = p_volume->GetChannelVolume( 0 );
+		d = p_volume->GetChannelVolume( 1 );
+	}
+	return lance_prechargee( whichStream, g, d );
+}
+
+bool	PCMAudio_SetStreamVolume( float volumeL, float volumeR, int whichStream )
+{
+	voix_volume( whichStream, volumeL, volumeR );
+	return true;
+}
+
+bool	PCMAudio_SetStreamVolume( Sfx::sVolume *p_volume, int whichStream )
+{
+	if( p_volume )
+		voix_volume( whichStream, p_volume->GetChannelVolume( 0 ), p_volume->GetChannelVolume( 1 ));
+	return true;
+}
+
+// Ignore, comme sur Xbox (p_music.cpp:1105).
 bool	PCMAudio_SetStreamPitch( float, int )				{ return true; }
 
-int		PCMAudio_GetStreamStatus( int )						{ return PCM_STATUS_FREE; }
+int		PCMAudio_GetStreamStatus( int whichStream )
+{
+	// -1 = "n'importe lequel" : FREE des qu'un canal est libre (Xbox:882).
+	int debut = whichStream, fin = whichStream + 1;
+	if( whichStream == -1 )
+	{
+		debut = 0;
+		fin   = NUM_STREAMS;
+	}
+	for( int s = debut; s < fin; ++s )
+	{
+		if( !canal_valide( s ) || !s_canal[s].actif )
+			return PCM_STATUS_FREE;
+	}
+	return PCM_STATUS_RUNNING;
+}
 
 bool	PCMAudio_TrackExists( const char *p_nom, int )
 {
@@ -591,7 +1269,7 @@ bool	PCMAudio_TrackExists( const char *p_nom, int )
 
 	// Une trace du couple nom -> checksum vivait ici. Elle a servi une fois,
 	// decisivement : elle a montre que le moteur demandait
-	// � MUSIC\VAG\SONGS\ACEYALONE � quand l'index attend � ACEYALONE �.
+	// "MUSIC\VAG\SONGS\ACEYALONE" quand l'index attend "ACEYALONE".
 	// A remettre si une piste ne se lance pas.
 	return ok;
 }
@@ -602,5 +1280,20 @@ bool	PCMAudio_LoadMusicHeader( const char * )
 {
 	return ( s_index != NULL );
 }
-bool	PCMAudio_LoadStreamHeader( const char * )			{ return false; }
-uint32	PCMAudio_FindNameFromChecksum( uint32, int )		{ return 0; }
+
+// "Legacy call left over from PS2 code" (Xbox, p_music.cpp:982) : true. Rendre
+// false mettrait streams_hed_there a faux et desactiverait TOUS les flux
+// (music.cpp:2228, StreamsDisabled). Aucun script de l'ISO ne l'appelle.
+bool	PCMAudio_LoadStreamHeader( const char * )			{ return true; }
+
+// Pcm::StreamExists (music.cpp:2277) : c'est par ici que CGoalPed decide
+// s'il y a une voix a jouer (GoalPed.cpp:347, 400). Xbox : p_music.cpp:1019.
+uint32	PCMAudio_FindNameFromChecksum( uint32 checksum, int ch )
+{
+	if(( ch != EXTRA_CHANNEL ) || !s_voix_index )
+		return 0;
+	if( !trouve_voix( checksum ))
+		return 0;
+	VLOG( "PCM", "voix %08x presente", checksum );
+	return checksum;
+}

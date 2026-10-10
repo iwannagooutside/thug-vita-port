@@ -3918,6 +3918,12 @@ static int cmp_idx_sect( const void *a, const void *b )
 	return ( x < y ) ? -1 : ( x > y ) ? 1 : 0;
 }
 
+// Issue publique #29 : tampon d'UV nuls et texture blanche pour les clones
+// de maillages sans texture (voir dessiner_instances).
+static GLuint s_uv_nul = 0;
+static int    s_uv_nul_nv = 0;
+static GLuint s_tex_blanche_inst = 0;
+
 static void dessiner_instances( void )
 {
 	if( !s_inst_n || !s_cur_view_ok || !g_vita_gxm_direct || !ShaderMateriauPret())
@@ -3938,6 +3944,46 @@ static void dessiner_instances( void )
 			}
 		qsort( sp_idx_sect, s_idx_sect_n, sizeof( SIdxSecteur ), cmp_idx_sect );
 		s_idx_sect_gen = s_world_gen;
+		// Issue publique #29 (lettres H-A-N-A N-U-I d'Hawaii) : maillages
+		// SANS texture ni UV, couleurs de sommets seules (secteurs
+		// GO_G_COLLECT3_* de HI.scn : materiau 0, pas de MATFLAG_TEXTURED).
+		// Le decor les dessine par le pipeline fixe (couleurs de sommets),
+		// mais leur clone (LevelObject, modelcomponent.cpp:67) passe ici par
+		// la variante GXM a une passe, qui echantillonne la passe 0 : on lui
+		// donne la texture blanche (XBox/NX/PixelShader1.psh : sommets x
+		// couleur du materiau) et un jeu d'UV nul, prepares ICI, hors de la
+		// session GXM. Taille = plus grand secteur concerne.
+		int nv_max = 0, n_sans_tex = 0;
+		for( int i = 0; i < s_num_world; ++i )
+		{
+			const SWorldMesh *p = &sp_world[i];
+			if( !p->is_sky && p->cbo && ( !p->texture || !p->uvbo ))
+			{
+				++n_sans_tex;
+				if( p->num_vertices > nv_max )
+					nv_max = p->num_vertices;
+			}
+		}
+		if( nv_max > s_uv_nul_nv )
+		{
+			float *z = (float *)calloc( (size_t)nv_max * 2, sizeof( float ));
+			if( z )
+			{
+				if( !s_uv_nul )
+					glGenBuffers( 1, &s_uv_nul );
+				glBindBuffer( GL_ARRAY_BUFFER, s_uv_nul );
+				glBufferData( GL_ARRAY_BUFFER, sizeof( float ) * 2 * nv_max, z, GL_STATIC_DRAW );
+				glBindBuffer( GL_ARRAY_BUFFER, 0 );
+				free( z );
+				s_uv_nul_nv = nv_max;
+			}
+		}
+		if( n_sans_tex )
+		{
+			s_tex_blanche_inst = texture_blanche();
+			VLOG( "SCN", "pieces clonees : %d maillages du decor sans texture/UV (texture blanche, UV nuls sur %d sommets)",
+			      n_sans_tex, s_uv_nul_nv );
+		}
 	}
 	glEnable( GL_DEPTH_TEST );
 	glDepthFunc( GL_LEQUAL );
@@ -4032,13 +4078,24 @@ static void dessiner_instances( void )
 				++s_rej[3];
 				continue;
 			}
-			if( !p->texture || !p->uvbo || !p->cbo )
+			// #29 : sans texture/UV mais avec couleurs de sommets -> texture
+			// blanche + UV nuls (prepares a la reconstruction de l'index).
+			const bool sans_tex = p->cbo && ( !p->texture || !p->uvbo );
+			if( !p->cbo || ( sans_tex && ( !s_tex_blanche_inst || !s_uv_nul
+			                               || ( p->num_vertices > s_uv_nul_nv ))))
 			{
 				++s_rej[4];
 				continue;
 			}
 			SShaderMateriau m;
 			materiau_shader_prepare( p, &m );
+			if( sans_tex )
+			{
+				m.passes = 1;
+				m.uvbo[0] = s_uv_nul;
+				m.uvbo[1] = m.uvbo[2] = m.uvbo[3] = 0;
+				m.wib = 0;
+			}
 			if( sv )
 			{
 				const unsigned int v = VitaSommetsVbo( sv, p->mesh_no );
@@ -4053,7 +4110,8 @@ static void dessiner_instances( void )
 				m.cbo = p->cbo;
 				m.c[0][0] = m.c[0][1] = m.c[0][2] = 0.5f;
 			}
-			const GLuint tg[4] = { p->texture, p->texture2, p->texture_x[0], p->texture_x[1] };
+			const GLuint tg[4] = { sans_tex ? s_tex_blanche_inst : p->texture,
+			                       p->texture2, p->texture_x[0], p->texture_x[1] };
 			const unsigned char au[4] = { p->addr_u, p->addr2_u, p->addr_xu[0], p->addr_xu[1] };
 			const unsigned char av[4] = { p->addr_v, p->addr2_v, p->addr_xv[0], p->addr_xv[1] };
 			SceGxmTexture *tex[4] = { NULL, NULL, NULL, NULL };

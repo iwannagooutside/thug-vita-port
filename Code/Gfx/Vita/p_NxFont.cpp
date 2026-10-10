@@ -65,6 +65,109 @@ void TextUnregister( Nx::CVitaText *p )
 	}
 }
 
+
+// --- Textes propres a la Xbox (issue #24) ------------------------------------
+//
+// Les scripts suivent la branche « case xbox » (Sys/Config/Vita/p_config.cpp
+// pose HARDWARE_XBOX, GetPlatform rend xbox) : messages de sauvegarde
+// « Saving %f to hard disk ...\nPlease do not turn off your Xbox console. »
+// (memcardmessages.q), « Save trick to Hard Drive » (catmenu.q:520), manette
+// debranchee (controller_pulling.q:123), « System Link Play » (menu principal).
+// On ne livre pas de scripts modifies : les joueurs fournissent leur ISO. Le
+// texte est donc reecrit au moment ou il entre dans un element d'ecran
+// (CTextElement::SetText, CTextBlockElement::SetText) -- APRES FormatText, d'ou
+// des sous-chaines plutot que des chaines entieres (%f, %s, %i deja remplaces).
+//
+// Les remplacements ne contiennent aucun motif de la table : appliquer la
+// table deux fois (bloc puis ligne) ne change rien de plus. Sensible a la
+// casse. Les credits (« Manager, Xbox Testing: ») ne sont pas touches.
+// Le texte des elements n'est jamais une cle : les scripts comparent leurs
+// parametres, pas l'affichage.
+struct STexteVita { const char *p_avant; const char *p_apres; };
+
+static const STexteVita s_textes_vita[] =
+{
+	// « Checking/Saving/Overwriting/Loading/Deleting ... hard disk ... »,
+	// « No THUG %n present on hard disk. », Create-A-Skater (memcardmessages.q)
+	{ "hard disk",					"memory card" },
+	// « Save trick to Hard Drive » (catmenu.q:520, trick slots pleins)
+	{ "Hard Drive",					"Memory Card" },
+	// « Please do not turn off your Xbox console. »
+	{ "your Xbox console",			"your PS Vita system" },
+	// « Your Xbox does not have enough free blocks to save ... »
+	{ "Your Xbox",					"Your memory card" },
+	// « Unable to load %s. Press A to continue. » -> icone de l'action Go
+	// (\m0 -> \b3 = croix, meta_button_map_xbox, gamemenu.q:105)
+	{ "Press A to continue",		"Press \\m0 to continue" },
+	// « Please reconnect the controller to port %i and press START ... »
+	{ "the controller to port ",	"controller " },
+	// Jeu en reseau local Xbox : menu principal, titre du skateshop,
+	// fichier de reglages, messages de cable (skateshop.q:1754, netmessages.q)
+	{ "System Link",				"LAN" },
+	{ "SYSTEM LINK",				"LAN" },
+	{ "system link",				"LAN" },
+};
+
+static const int NUM_TEXTES_VITA = sizeof( s_textes_vita ) / sizeof( s_textes_vita[0] );
+
+// Premier motif present a partir de p, et sa position ; NULL si aucun.
+static const STexteVita *motif_suivant( const char *p, const char **pp_pos )
+{
+	const STexteVita *p_best = NULL;
+	const char *p_best_pos = NULL;
+	for( int i = 0; i < NUM_TEXTES_VITA; ++i )
+	{
+		const char *q = strstr( p, s_textes_vita[i].p_avant );
+		if( q && ( !p_best_pos || ( q < p_best_pos )))
+		{
+			p_best     = &s_textes_vita[i];
+			p_best_pos = q;
+		}
+	}
+	*pp_pos = p_best_pos;
+	return p_best;
+}
+
+char *TexteVitaSubstitue( const char *p_in )
+{
+	if( !p_in || !*p_in )
+		return NULL;
+
+	const char *p_pos;
+	if( !motif_suivant( p_in, &p_pos ))
+		return NULL;					// cas courant : rien a faire
+
+	// Passe 1 : longueur du resultat.
+	size_t len = 0;
+	const char *p = p_in;
+	const STexteVita *m;
+	while(( m = motif_suivant( p, &p_pos )) != NULL )
+	{
+		len += ( p_pos - p ) + strlen( m->p_apres );
+		p = p_pos + strlen( m->p_avant );
+	}
+	len += strlen( p );
+
+	char *p_out = (char *)malloc( len + 1 );
+	if( !p_out )
+		return NULL;
+
+	// Passe 2 : copie.
+	char *o = p_out;
+	p = p_in;
+	while(( m = motif_suivant( p, &p_pos )) != NULL )
+	{
+		memcpy( o, p, p_pos - p );				o += p_pos - p;
+		size_t n = strlen( m->p_apres );
+		memcpy( o, m->p_apres, n );				o += n;
+		p = p_pos + strlen( m->p_avant );
+	}
+	strcpy( o, p );
+
+	VLOG( "TXT", "texte Vita : \"%.80s\" -> \"%.80s\"", p_in, p_out );
+	return p_out;
+}
+
 } // namespace NxVita
 
 
@@ -307,9 +410,17 @@ bool CVitaFont::plat_load( const char *filename )
 	File::Read( p_idx, num_bytes, 1, p_file );
 	File::Read( clut, 1024, 1, p_file );
 
-	// Palette : D3DCOLOR (0xAARRGGBB) -> RGBA, et alpha double. Les alphas du
-	// moteur plafonnent a 0x80 (heritage PS2) ; sans ce doublement, tout le
+	// Palette : octets R, G, B, A dans le fichier, et alpha double. Les alphas
+	// du moteur plafonnent a 0x80 (heritage PS2) ; sans ce doublement, tout le
 	// texte serait a demi transparent.
+	//
+	// [SOURCE] XBox/NX/chars.cpp:456 « Switch from RGBA to BGRA format
+	// palette » : la palette du .fnt.xbx est en RGBA (rouge dans l'octet de
+	// poids faible), que la Xbox convertit en D3DCOLOR. La version precedente
+	// la lisait deja comme un D3DCOLOR, donc rouge et bleu echanges -- sans
+	// effet visible sur le texte blanc, mais les icones de ButtonsPs2
+	// sortaient en croix jaune, rond bleu, triangle olive (issue #23). Lues
+	// correctement : croix bleue, rond rouge, carre rose, triangle vert.
 	unsigned char *p_rgba = (unsigned char *)malloc( tw * th * 4 );
 	if( !p_rgba )
 	{
@@ -322,9 +433,9 @@ bool CVitaFont::plat_load( const char *filename )
 		const unsigned char *p_c = clut + p_idx[i] * 4;
 		unsigned int a = p_c[3];
 		a = ( a >= 0x80 ) ? 0xFF : ( a * 2 );
-		p_rgba[i * 4 + 0] = p_c[2];		// R
+		p_rgba[i * 4 + 0] = p_c[0];		// R
 		p_rgba[i * 4 + 1] = p_c[1];		// G
-		p_rgba[i * 4 + 2] = p_c[0];		// B
+		p_rgba[i * 4 + 2] = p_c[2];		// B
 		p_rgba[i * 4 + 3] = (unsigned char)a;
 	}
 	free( p_idx );

@@ -42,7 +42,7 @@ better: which level, what you were doing, a photo if you can.
 - The **Xbox** version of *Tony Hawk's Underground*, **USA** release, as a disc
   image (ISO) dumped from a disc you own. Other versions (PS2, GameCube, PAL)
   won't work: the game reads the Xbox data files directly.
-- About **1.6 GB** free on your memory card.
+- About **3.2 GB** free on your memory card (1.6 GB without the videos).
 
 ## Installing
 
@@ -54,8 +54,9 @@ better: which level, what you were doing, a photo if you can.
    ```
 
    You get a folder with a `data` folder inside. That's the part you need.
-   You can delete the `movies` folder inside it: the port doesn't play videos,
-   and that saves 1.6 GB.
+   Keep everything in it, including `movies` (the intro, pro and sponsor
+   videos) and `streams` (music and voices). If space is tight, you can delete
+   `movies`: the videos are then skipped and the game carries on normally.
 
 2. **Copy it to the Vita.** Using VitaShell, copy that `data` folder so you
    end up with the line below. USB is much faster than FTP for this (FTP can
@@ -95,7 +96,23 @@ The Vita has no L2/R2, which the game uses a lot. Here's where everything went:
 | **Both bottom corners** at once | L1 + R1 | Get off the board, or back on |
 | START | START | Pause menu |
 
-The rear touchpad does nothing, so you can rest your fingers on it.
+The rear touchpad does nothing by default, so you can rest your fingers on it.
+
+### Vita Options
+
+The port adds its own settings menu: **Options > Control Setup > Vita Options**
+(from the main menu or the pause menu). Changes apply right away and are kept
+in `ux0:data/thug/controls.txt`, which you can also edit by hand:
+
+| Setting | What it does |
+|---|---|
+| `invert_left_x`, `invert_left_y` | Invert the left stick (skater and menus) |
+| `invert_right_x`, `invert_right_y` | Invert the right stick (camera) |
+| `touch_on_rear_pad=1` | Put L1/R1 (spins) on the rear touchpad, left half / right half, instead of the screen corners |
+| `triggers_as_l2r2=0` | Swap the layout: L/R buttons become L1/R1, and L2/R2 go to the touch area |
+| `framerate=30` | Lock the game to 30 fps (steadier in the heaviest levels). Default 60 |
+
+Delete the file to get the defaults back.
 
 ## Saves
 
@@ -117,8 +134,8 @@ then rescan your games.
 
 ## Good to know
 
-- **No videos.** The intro and the cutscene videos use a format (Bink) that the
-  port can't play yet. They're skipped, and the game carries on normally.
+- **Videos.** The intro, pro and sponsor videos play from the `movies` folder.
+  Press START or ✕ to skip one.
 - **No online play.** The game's online service shut down years ago.
 - A few small visual details can still differ from the Xbox version. If you
   spot one, an issue with a photo helps a lot.
@@ -149,6 +166,15 @@ cmake -S vita -B vita/build \
 make -C vita/build
 ```
 
+The videos need a small FFmpeg build with only the Bink decoders. Build it
+once, before CMake (it installs to `~/vita-build/ffmpeg-bink`, where CMake
+looks for it; without it the game builds fine and skips the videos):
+
+```
+curl -LO https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz && tar xf ffmpeg-7.1.1.tar.xz
+sh Code/Gel/Movies/Vita/build_ffmpeg_bink.sh "$PWD/ffmpeg-7.1.1" /tmp/ffmpeg-bink-build ~/vita-build/ffmpeg-bink
+```
+
 `THUG_RELEASE=ON` builds the public version. Without it you get the development
 build, with a debug server on the network and test shortcuts.
 
@@ -168,6 +194,7 @@ It needs an internet connection the first time, to fetch a font.
   or endorsed by them, and all trademarks belong to their owners.
 - [kisak-thug](https://github.com/SwagSoftware/kisak-thug), the PC project this
   port builds on.
+- [FFmpeg](https://ffmpeg.org) (LGPL 2.1+) for the Bink video decoder.
 - [vitaGL](https://github.com/Rinnegatamante/vitaGL) by Rinnegatamante, and
   the [vitasdk](https://vitasdk.org) team.
 - [u/BlazeRed16](https://www.reddit.com/user/BlazeRed16) for the RetroFlow cover.

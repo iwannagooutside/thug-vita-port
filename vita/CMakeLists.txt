@@ -16,7 +16,7 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "THUG")
 set(VITA_TITLEID  "THUG00001")
-set(VITA_VERSION  "01.03")
+set(VITA_VERSION  "01.04")
 
 # ATTRIBUTE2=12 débloque les 109 Mio de RAM supplémentaires (365 au lieu des
 # 256 par défaut). Le moteur tenait dans les 32 Mo de la PS2, donc c'est de la
@@ -257,6 +257,37 @@ target_include_directories(${PROJECT_NAME} PRIVATE
   "${THUG_ROOT}/Code/Gfx/Vita"
 )
 
+# Menu VITA OPTIONS : vita/qb/vita_options.q (script QB ecrit par nous) est
+# assemble par vita/tools/qbasm.py en tableau d'octets, vita_options_qb.h,
+# genere dans le dossier de build (pas commite : le .q fait foi). Charge
+# apres qb.prx par Sk/Scripting/Vita/vita_qb_options.cpp. Sans python3, le
+# jeu se construit quand meme, sans ce menu (THUG_SANS_MENU_VITA, log [QB]).
+find_package(Python3 COMPONENTS Interpreter)
+set(THUG_QB_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/gen")
+set(THUG_QB_OPTIONS_CPP "${THUG_ROOT}/Code/Sk/Scripting/Vita/vita_qb_options.cpp")
+if(Python3_Interpreter_FOUND)
+  add_custom_command(
+    OUTPUT "${THUG_QB_GEN_DIR}/vita_options_qb.h"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${THUG_QB_GEN_DIR}"
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/qbasm.py" asm
+            "${CMAKE_CURRENT_SOURCE_DIR}/qb/vita_options.q"
+            -o "${THUG_QB_GEN_DIR}/vita_options.qb"
+            --header "${THUG_QB_GEN_DIR}/vita_options_qb.h"
+            --symbol vita_options_qb
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/qb/vita_options.q"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/qbasm.py"
+    COMMENT "qbasm : vita_options.q -> vita_options_qb.h"
+    VERBATIM)
+  target_sources(${PROJECT_NAME} PRIVATE "${THUG_QB_GEN_DIR}/vita_options_qb.h")
+  set_source_files_properties("${THUG_QB_OPTIONS_CPP}" PROPERTIES
+                              OBJECT_DEPENDS "${THUG_QB_GEN_DIR}/vita_options_qb.h")
+  target_include_directories(${PROJECT_NAME} PRIVATE "${THUG_QB_GEN_DIR}")
+else()
+  message(WARNING "python3 absent : menu Vita Options non embarque")
+  set_source_files_properties("${THUG_QB_OPTIONS_CPP}" PROPERTIES
+                              COMPILE_DEFINITIONS THUG_SANS_MENU_VITA)
+endif()
+
 # vitaGL recompile a part (options de vitesse) :
 #   cmake -DTHUG_VITAGL_DIR=/chemin/vers/vitaGL ...
 # Sans l'option, c'est la libvitaGL.a du vitasdk qui est liee. Issue #18.
@@ -267,6 +298,23 @@ endif()
 
 # Espion GL (#48) : appels du jeu qui coupent ou effacent la scene.
 target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=glClear,--wrap=glBindFramebuffer,--wrap=glFinish,--wrap=glFlush,--wrap=glReadPixels,--wrap=glGetQueryObjectuiv,--wrap=malloc,--wrap=free,--wrap=realloc,--wrap=calloc,--wrap=memalign,--wrap=sceShaccCgCompileProgram,--wrap=sceGxmShaderPatcherCreateVertexProgram")
+
+# FMV Bink (#3) : FFmpeg minimal (demuxeur bink + decodeurs binkvideo et
+# binkaudio), construit par Code/Gel/Movies/Vita/build_ffmpeg_bink.sh dans un
+# prefixe A PART (le paquet vdpm ffmpeg n'a pas Bink). Absent : les films
+# restent sautes, comme chez kisak. LGPL 2.1+ : lien statique a remplacer par
+# un module .suprx avant toute release publique qui l'embarque.
+set(THUG_FFMPEG_BINK_DIR "$ENV{HOME}/vita-build/ffmpeg-bink" CACHE PATH "prefixe FFmpeg Bink")
+if(EXISTS "${THUG_FFMPEG_BINK_DIR}/lib/libavcodec.a")
+  target_sources(${PROJECT_NAME} PRIVATE "${THUG_ROOT}/Code/Gel/Movies/Vita/vita_bink.c")
+  target_include_directories(${PROJECT_NAME} PRIVATE "${THUG_FFMPEG_BINK_DIR}/include")
+  target_link_directories(${PROJECT_NAME} PRIVATE "${THUG_FFMPEG_BINK_DIR}/lib")
+  target_compile_definitions(${PROJECT_NAME} PRIVATE THUG_FMV)
+  target_link_libraries(${PROJECT_NAME} avformat avcodec avutil pthread)
+  message(STATUS "FMV : FFmpeg Bink ${THUG_FFMPEG_BINK_DIR}")
+else()
+  message(STATUS "FMV : FFmpeg Bink absent, films sautes")
+endif()
 
 target_link_libraries(${PROJECT_NAME}
   vitaGL

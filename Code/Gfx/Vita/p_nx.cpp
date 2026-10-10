@@ -707,7 +707,9 @@ void	CEngine::s_plat_pre_render()
 		}
 	}
 	// celui de la frame precedente et plus rien ne se dessine correctement.
-	// VIOLET FRANC, et definitivement.
+	// VIOLET FRANC pour le diagnostic -- mais plus par defaut depuis #18 :
+	// XBox laisse voir sa couleur d'effacement (gris-bleu 0x506070) sous les
+	// translucides du parc plage. Voir plus bas.
 	//
 	// Le bleu nuit (0,0,38) qui etait ici est INDISCERNABLE du ciel nocturne de
 	// New Jersey. Des heures d'enquete ont pris le tampon efface pour du ciel
@@ -738,7 +740,23 @@ void	CEngine::s_plat_pre_render()
 	NxVita::OmbreCarteRendu();
 	ACC( ACC_OMBRE );
 	NxVita::GammaImageDebut();
-	glClearColor( 0.45f, 0.05f, 0.65f, 1.0f );
+	// Issue #18 (parc a theme plage du Create-a-Park) : la couleur
+	// d'effacement FAIT PARTIE de l'image d'origine. [SOURCE] XBox/p_nx.cpp:202
+	// efface a EngineGlobals.clear_color = 0x00506070 (XBox/NX/nx_init.cpp:138,
+	// jamais modifiee ailleurs ; DX9/NX/nx_init.cpp:180 idem). Le theme 2
+	// (sk5ed3) a un ciel en demi-dome qui ne descend pas sous y = 5
+	// (sk5ed3_sky.scn.xbx, rayon ~470 : bord a ~0,6 degre au-dessus de
+	// l'horizon) et une mer TRANSLUCIDE jusqu'a l'horizon (materiau 7dad8472,
+	// BLEND, alpha de sommets 51..90/128, soit 40 a 70 %) sans rien d'opaque
+	// dessous, plus un anneau de brume translucide (1d9e8ab2, r ~59000).
+	// Sous le bord du dome, XBox melange donc mer et brume avec ce gris-bleu ;
+	// nous les melangions avec le violet de diagnostic.
+	// Violet garde pour le diagnostic : rendu par identifiant (« id 1 ») ou
+	// g_vita_fond_violet (p_world_render.h).
+	if( NxVita::g_vita_fond_violet || NxVita::g_vita_id_debug )
+		glClearColor( 0.45f, 0.05f, 0.65f, 1.0f );
+	else
+		glClearColor( 80.0f / 255.0f, 96.0f / 255.0f, 112.0f / 255.0f, 1.0f );
 	glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 	g_vita_image_ouverte = true;	// #48
 	vita_glspy_ouverte = 1; vita_glspy_phase = 1;
@@ -1373,12 +1391,23 @@ CViewport *CViewportManager::s_plat_create_viewport( const Mth::Rect *rect, Gfx:
 
 namespace NxVita
 {
+// Couleur d'effacement de diagnostic (violet franc) au lieu de celle de XBox
+// (issue #18). Faux par defaut : XBox montre sa couleur d'effacement a
+// l'ecran, sous les translucides qui n'ont rien derriere eux.
+bool g_vita_fond_violet = false;
+
 // « fps 30|60 » (p_siodev.cpp). vitaGL attend N vsync par image
 // (gxm.c:265, sceDisplayWaitVblankStartMulti). A 30, chaque image dure
 // exactement 2 vsync : un rythme regulier la ou 60 n'est pas tenu (22 ms
 // mesures en roulant dans New Jersey) et ou les images alternent 1 et 2 vsync.
+// Cadence courante, lue par le menu VITA OPTIONS et ecrite dans controls.txt
+// (cle "framerate", Sys/SIO/Vita/p_siodev.cpp). 60 = reglage de vitaGL au
+// demarrage (vsync_interval = 1, vgl.c).
+int g_vita_cadence = 60;
+
 void FixerCadence( int images_par_seconde )
 {
+	g_vita_cadence = ( images_par_seconde == 30 ) ? 30 : 60;
 	eglSwapInterval( 0, ( images_par_seconde == 30 ) ? 2 : 1 );
 	VLOG( "GFX", "cadence : %d images/s", ( images_par_seconde == 30 ) ? 30 : 60 );
 }

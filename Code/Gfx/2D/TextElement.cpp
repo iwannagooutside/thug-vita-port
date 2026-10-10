@@ -12,6 +12,13 @@
 #include <gfx/2D/BlurEffect.h>
 #include <gfx/2D/Window.h>
 
+#ifdef __PLAT_VITA__
+#include <stdlib.h>
+// Gfx/Vita/p_NxFont.cpp (issue #24) : textes Xbox des scripts reecrits pour
+// la Vita ; copie malloc ou NULL. Declare ici pour ne pas tirer vitaGL.h.
+namespace NxVita { char *TexteVitaSubstitue( const char *p_in ); }
+#endif
+
 #define BLUR_EFFECT_ON 1
 
 namespace Front
@@ -169,6 +176,13 @@ void CTextElement::SetFont(uint32 font_checksum)
 
 void CTextElement::SetText(const char *pText)
 {
+#ifdef __PLAT_VITA__
+	// Issue #24 : « hard disk », « Xbox console »... (p_NxFont.cpp). Garde le
+	// texte d'origine si le remplacement depasse la taille d'un element.
+	char *p_vita = NxVita::TexteVitaSubstitue( pText );
+	if( p_vita && ( (int)strlen( p_vita ) + 1 < vMAX_TEXT_LENGTH ))
+		pText = p_vita;
+#endif
 	int new_length = strlen(pText) + 1;
 	Dbg_MsgAssert(new_length < vMAX_TEXT_LENGTH, ("string too long %d", new_length));
 
@@ -213,6 +227,9 @@ void CTextElement::SetText(const char *pText)
 		}
 	}
 	*p_out = '\0';
+#ifdef __PLAT_VITA__
+	free( p_vita );			// pText n'est plus lu au-dela
+#endif
 	
 	if( mp_font )
 	{
@@ -853,6 +870,25 @@ void CTextBlockElement::SetText(const char **ppTextLines, int numLines)
 	Dbg_MsgAssert(m_object_flags & vFORCED_DIMS, ("no dimensions have been set"));
 	Dbg_MsgAssert(numLines < 256, ("large number of lines, probably not good"));
 
+#ifdef __PLAT_VITA__
+	// Issue #24 : meme reecriture que CTextElement::SetText, mais AVANT la
+	// coupure en lignes, pour que le retour a la ligne suive le nouveau texte.
+	// Les lignes d'entree peuvent depasser la taille d'un element (dialogues).
+	const char *p_vita_lignes[256];
+	char *p_vita_copies[256];
+	int num_vita = ( numLines <= 256 ) ? numLines : 0;
+	bool vita_change = false;
+	for( int v = 0; v < num_vita; v++ )
+	{
+		p_vita_copies[v] = NxVita::TexteVitaSubstitue( ppTextLines[v] );
+		p_vita_lignes[v] = p_vita_copies[v] ? p_vita_copies[v] : ppTextLines[v];
+		if( p_vita_copies[v] )
+			vita_change = true;
+	}
+	if( vita_change )
+		ppTextLines = p_vita_lignes;
+#endif
+
 //	char parsed_lines[MAX_LINES][MAX_CHARS]; 
 								  
 	CScreenElementManager* p_manager = CScreenElementManager::Instance();
@@ -982,6 +1018,10 @@ void CTextBlockElement::SetText(const char **ppTextLines, int numLines)
 	delete mpp_parsed_lines[0];
 	delete mpp_parsed_lines;
 
+#ifdef __PLAT_VITA__
+	for( int v = 0; v < num_vita; v++ )
+		free( p_vita_copies[v] );
+#endif
 	
 	SetChildLockState(LOCK);
 

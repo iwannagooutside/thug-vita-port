@@ -25,8 +25,13 @@
 **    superposent, et le debordement s'entend comme un craquement.          **
 **                                                                          **
 **  - Le pas de lecture est en virgule fixe 16.16 : il porte a la fois le   **
-**    reechantillonnage 44100 -> 48000 et le pitch demande par le jeu, sans **
-**    calcul flottant par echantillon.                                      **
+**    reechantillonnage 44100 -> 48000 et le pitch demande par le jeu. La   **
+**    POSITION, elle, est un index entier + une fraction 16 bits separes    **
+**    (#26, #30) : en 16.16 dans 32 bits elle debordait a 65536             **
+**    echantillons (1,49 s), soit TOUS les sons de roulement et de grind.   **
+**                                                                          **
+**  - Interpolation cubique (Hermite/Catmull-Rom), gains lisses par grain,  **
+**    fondu court a l'arret et limiteur sur la somme : voir thread_mixeur.  **
 *****************************************************************************/
 
 #include <core/defines.h>
@@ -40,10 +45,12 @@
 #include <psp2/audioout.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/fcntl.h>
 
 #include <stdlib.h>
 #include <malloc.h>
 #include <string.h>
+#include <math.h>
 
 #include "vita_log.h"
 
@@ -58,16 +65,34 @@ namespace
 #define SORTIE_HZ		48000	/* le port BGM tourne deja a 48000 */
 #define SORTIE_CANAUX	2
 // 512 et non 1024 : le port MAIN n'accepte pas plus (64..512, multiple de 64).
+// Le port VOICE (1024) est deja pris par les voix des dialogues (0x80260005).
 #define GRAIN			512
+static const int	s_grain		= GRAIN;
 
 // Etat d'une voix du mixeur.
 struct SVoix
 {
 	const SSonVita	*p_son;
-	unsigned int	 position;		// virgule fixe 16.16 dans le son
+	// [REFUTE] (#26, #30) La position etait un 16.16 dans un unsigned 32 bits :
+	// il deborde a 65536 echantillons, soit 1,49 s a 44100 Hz. Or TOUS les
+	// sons de roulement et de grind sont plus longs (RollConcSmooth02 : 162048
+	// echantillons, RollAsphalt ~116000, GrindMetal02 173824). La lecture
+	// revenait donc au debut toutes les 1,49 s, au milieu du son -- saut de
+	// 9580 a -8 sur RollConcSmooth02 : le craquement periodique du roulement.
+	// Et un son PONCTUEL de plus de 65536 echantillons (FallWater,
+	// FlamingFireBall01) ne finissait jamais : la position ne pouvait plus
+	// atteindre sa fin. Index entier et fraction sont desormais separes.
+	unsigned int	 idx;			// echantillon courant
+	unsigned int	 frac;			// fraction 0..65535
 	unsigned int	 pas;			// increment 16.16 par echantillon de sortie
-	int				 vol_g;			// 0..256
+	int				 vol_g;			// demande du moteur, 256 = 100 % (plafond 400 %)
 	int				 vol_d;
+	// Gains effectivement appliques a la fin du dernier grain. Le mixeur va
+	// de ces gains vers la cible (vol x volume global) en rampe sur un grain :
+	// le roulement change de volume a chaque image, et un saut de gain net
+	// s'entend comme un clic ("zipper").
+	float			 gain_g;
+	float			 gain_d;
 	bool			 active;
 	bool			 boucle;
 	// #57 : age de la voix ; une voix en boucle active plus de 20 s est
@@ -79,11 +104,37 @@ struct SVoix
 
 static SVoix	s_voix[NUM_VOICES];
 
+// Voix arretees en cours de fondu : copie de la voix, jouee UN grain de plus
+// avec un gain qui descend a zero. Couper net un son fort (roulement, grind)
+// au milieu d'une onde fait un clic. La voix d'origine est libre aussitot :
+// le moteur peut la reattribuer sans attendre la fin du fondu.
+static SVoix	s_fondus[NUM_VOICES];
+
+// Diagnostic #26/#30, journalise par PerFrameUpdate quand ca change.
+static volatile int	s_nb_retards	= 0;	// port vide a l'arrivee du grain
+static volatile int	s_nb_limites	= 0;	// grains ou le limiteur a agi
+static volatile unsigned int s_us_calcul_max = 0;	// melange d'un grain, pire cas
+static volatile unsigned int s_us_ecart_max  = 0;	// entre deux sorties, pire cas
+
+// Commande de dev "mix N" (#30) : enregistre N secondes de la sortie reelle du
+// mixeur, ecrites ensuite dans ux0:data/thug/mix.wav par le thread principal.
+static short	*s_enreg		= NULL;
+static volatile int	s_enreg_pos	= 0;	// en echantillons stereo
+static int		s_enreg_max		= 0;
+static volatile bool s_enreg_plein = false;
+static float		s_limite		= 1.0f;	// gain courant du limiteur
+
 static int		s_port			= -1;
 static SceUID	s_thread		= -1;
 static SceUID	s_mutex			= -1;
 static bool		s_tourne		= false;
-static short	*s_melange		= NULL;
+// DOUBLE TAMPON (#30) : sceAudioOutOutput ne copie pas le tampon, la Vita le
+// lit PENDANT qu'il joue. Recalculer le grain suivant dans le meme tampon
+// ecrasait le son en cours de lecture -- le craquement entendu sur console
+// alors que l'enregistrement du melange (pris avant l'envoi) etait propre.
+// On alterne entre deux moities, comme le pilote audio Vita de SDL.
+static short	*s_melange		= NULL;	// moitie en cours de calcul
+static short	*s_melange_base	= NULL;	// deux grains
 static int		s_volume_global	= 256;	// 0..256
 
 static inline void verrouille( void )
@@ -112,17 +163,151 @@ static void volumes_depuis( sVolume *p_vol, int *p_g, int *p_d )
 	if( g < 0.0f )	g = -g;
 	if( d < 0.0f )	d = -d;
 
+	// Plafond large ici : comme XBox/p_sfx.cpp:1216, le volume du canal est
+	// d'abord multiplie par le volume global des effets, et c'est le RESULTAT
+	// qui est plafonne a 100 % (gain_effectif).
+	if( g > 400.0f )	g = 400.0f;
+	if( d > 400.0f )	d = 400.0f;
 	*p_g = (int)( g * 2.56f );
 	*p_d = (int)( d * 2.56f );
-	if( *p_g > 256 )	*p_g = 256;
-	if( *p_d > 256 )	*p_d = 256;
 	if( *p_g < 0 )		*p_g = 0;
 	if( *p_d < 0 )		*p_d = 0;
 }
 
 
+// Gain lineaire applique : volume du canal x volume global, plafonne a 1.
+// La XBox convertit le meme pourcentage en dB (20 log10(v/100), p_sfx.cpp:1230),
+// ce qui revient exactement a ce gain lineaire.
+static inline float gain_effectif( int vol, int vg )
+{
+	int g = ( vol * vg ) >> 8;
+	if( g > 256 )
+		g = 256;
+	return (float)g * ( 1.0f / 256.0f );
+}
+
+
+// Echantillon i d'un son, hors bornes compris. Un son en boucle se replie sur
+// son debut (la XBox boucle le tampon ENTIER, DSBPLAY_LOOPING sans region,
+// Xbox/p_sfx.cpp:993) ; un son ponctuel commence par son premier echantillon
+// et se tait apres sa fin.
+static inline float echantillon( const SSonVita *p_s, int i, bool boucle )
+{
+	const int n = p_s->nb_echantillons;
+	if( i < 0 )
+		return boucle ? (float)p_s->p_echantillons[(( i % n ) + n ) % n]
+		              : (float)p_s->p_echantillons[0];
+	if( i >= n )
+		return boucle ? (float)p_s->p_echantillons[i % n] : 0.0f;
+	return (float)p_s->p_echantillons[i];
+}
+
+
+// Mixe un grain d'une voix dans accu, avec un gain qui va lineairement de
+// gain_g/gain_d a cible_g/cible_d. Rend false si un son ponctuel est fini.
+//
+// [REFUTE] (#26) "lire l'echantillon le plus proche suffit". Mesure sur
+// table (Python) contre un reechantillonneur de reference (scipy
+// resample_poly 160/147) : le plus proche donne un rapport signal/erreur de
+// 0,8 dB sur menu03, 5,7 dB sur GUI_click06, 20 dB sur DE_MenuSelect, 17 dB
+// sur les boucles de roulement -- l'erreur est presque aussi forte que le son,
+// c'est le gresillement des menus. Cubique : 18, 28, 42 et 31 dB.
+static bool mixe_voix( SVoix *p_v, float *accu, float cible_g, float cible_d )
+{
+	const SSonVita	*p_s	= p_v->p_son;
+	const short		*e		= p_s->p_echantillons;
+	const unsigned int n	= (unsigned int)p_s->nb_echantillons;
+	const bool		boucle	= p_v->boucle;
+	const unsigned int pas	= p_v->pas;
+	unsigned int	idx		= p_v->idx;
+	unsigned int	frac	= p_v->frac;
+
+	float g = p_v->gain_g;
+	float d = p_v->gain_d;
+	const float dg = ( cible_g - g ) * ( 1.0f / s_grain );
+	const float dd = ( cible_d - d ) * ( 1.0f / s_grain );
+
+	for( int i = 0; i < s_grain; ++i )
+	{
+		if( idx >= n )
+		{
+			if( !boucle )
+			{
+				p_v->idx = idx;
+				return false;
+			}
+			// Rebouclage SANS perdre la fraction ni sauter d'echantillon de
+			// sortie. L'ancien code ecrivait un zero a cet instant (le
+			// "continue" sautait l'addition) : un clic a chaque tour.
+			idx %= n;
+		}
+
+		float xm, x0, x1, x2;
+		if(( idx >= 1 ) && ( idx + 2 < n ))
+		{
+			xm = e[idx - 1];
+			x0 = e[idx];
+			x1 = e[idx + 1];
+			x2 = e[idx + 2];
+		}
+		else
+		{
+			xm = echantillon( p_s, (int)idx - 1, boucle );
+			x0 = echantillon( p_s, (int)idx, boucle );
+			x1 = echantillon( p_s, (int)idx + 1, boucle );
+			x2 = echantillon( p_s, (int)idx + 2, boucle );
+		}
+
+		// Hermite (Catmull-Rom) a 4 points.
+		const float t  = (float)frac * ( 1.0f / 65536.0f );
+		const float c1 = 0.5f * ( x1 - xm );
+		const float c2 = xm - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
+		const float c3 = 0.5f * ( x2 - xm ) + 1.5f * ( x0 - x1 );
+		const float s  = (( c3 * t + c2 ) * t + c1 ) * t + x0;
+
+		g += dg;
+		d += dd;
+		accu[i * 2    ] += s * g;
+		accu[i * 2 + 1] += s * d;
+
+		frac += pas;
+		idx  += frac >> 16;
+		frac &= 0xFFFF;
+	}
+
+	p_v->idx	= idx;
+	p_v->frac	= frac;
+	p_v->gain_g	= cible_g;
+	p_v->gain_d	= cible_d;
+	return true;
+}
+
+
+// Arrete une voix en passant par un fondu. Appelee SOUS le verrou.
+static void arrete_voix( SVoix *p_v )
+{
+	if( !p_v->active )
+		return;
+	p_v->active = false;
+	if( !p_v->p_son || (( p_v->gain_g <= 0.0f ) && ( p_v->gain_d <= 0.0f )))
+		return;
+	for( int f = 0; f < NUM_VOICES; ++f )
+	{
+		if( !s_fondus[f].active )
+		{
+			s_fondus[f]			= *p_v;
+			s_fondus[f].active	= true;
+			return;
+		}
+	}
+	// Plus de place : arret net, comme avant.
+}
+
+
 static int thread_mixeur( SceSize, void * )
 {
+	bool sortait = false;	// le grain precedent a ete envoye au port
+	SceUInt64 t_sortie = 0;	// fin du dernier sceAudioOutOutput
 
 	while( s_tourne )
 	{
@@ -130,46 +315,35 @@ static int thread_mixeur( SceSize, void * )
 		// decisivement : il a montre que le thread CESSAIT de tourner ~8 s
 		// avant le premier son joue, ce qui a designe CleanUpSoundFX et non
 		// la boucle de melange. A remettre en premier si un silence revient.
-		// Le melange se fait en 32 bits : la somme de plusieurs voix fortes
-		// depasse allegrement le 16 bits, et l'ecretage doit se faire UNE
+		// Le melange se fait en flottant : la somme de plusieurs voix fortes
+		// depasse allegrement le 16 bits, et la limitation doit se faire UNE
 		// fois, a la fin, pas a chaque addition.
-		static int accu[GRAIN * SORTIE_CANAUX];
+		static float accu[GRAIN * SORTIE_CANAUX];
 		memset( accu, 0, sizeof( accu ));
 
 		bool quelque_chose = false;
 
 		verrouille();
+		const int vg = s_volume_global;
 		for( int v = 0; v < NUM_VOICES; ++v )
 		{
 			SVoix *p_v = &s_voix[v];
 			if( !p_v->active || !p_v->p_son )
 				continue;
-
-			const SSonVita *p_s = p_v->p_son;
 			quelque_chose = true;
-
-			for( int i = 0; i < GRAIN; ++i )
-			{
-				const unsigned int idx = p_v->position >> 16;
-				if( (int)idx >= p_s->nb_echantillons )
-				{
-					if( p_v->boucle )
-					{
-						p_v->position = 0;
-						continue;
-					}
-					p_v->active = false;
-					break;
-				}
-
-				const int e = p_s->p_echantillons[idx];
-				accu[i * 2    ] += ( e * p_v->vol_g ) >> 8;
-				accu[i * 2 + 1] += ( e * p_v->vol_d ) >> 8;
-
-				p_v->position += p_v->pas;
-			}
+			if( !mixe_voix( p_v, accu, gain_effectif( p_v->vol_g, vg ),
+			                gain_effectif( p_v->vol_d, vg )))
+				p_v->active = false;
 		}
-		const int vg = s_volume_global;
+		for( int f = 0; f < NUM_VOICES; ++f )
+		{
+			SVoix *p_f = &s_fondus[f];
+			if( !p_f->active )
+				continue;
+			quelque_chose = true;
+			mixe_voix( p_f, accu, 0.0f, 0.0f );
+			p_f->active = false;	// un seul grain de fondu (~10 ms)
+		}
 		deverrouille();
 
 		if( !quelque_chose )
@@ -177,19 +351,97 @@ static int thread_mixeur( SceSize, void * )
 			// Aucune voix : on ne pousse pas de silence en boucle serree, on
 			// rend la main. Sans cela ce thread tournerait en continu pour
 			// rien, sur une console ou chaque coeur compte.
+			sortait = false;
 			sceKernelDelayThread( 5000 );
 			continue;
 		}
 
-		for( int i = 0; i < GRAIN * SORTIE_CANAUX; ++i )
+		// LIMITEUR sur la somme (#30). Chaque voix est au meme gain que sur
+		// XBox, mais les effets sont masterises tres fort (DE_MenuSelect :
+		// RMS -8 dBFS ; les BailBodyPunch ont deja des milliers d'echantillons
+		// a fond dans le fichier) : deux ou trois sons simultanes depassent
+		// le 16 bits, et l'ecretage net qui suivait est la saturation
+		// entendue. Gain reduit d'un coup (32 echantillons) si la crete du
+		// grain depasse le plafond, remonte en ~150 ms ensuite. L'ecretage
+		// final ne sert plus que de filet.
+		float crete = 0.0f;
+		for( int i = 0; i < s_grain * SORTIE_CANAUX; ++i )
 		{
-			int e = ( accu[i] * vg ) >> 8;
-			if( e >  32767 )	e =  32767;
-			if( e < -32768 )	e = -32768;
-			s_melange[i] = (short)e;
+			const float a = fabsf( accu[i] );
+			if( a > crete )
+				crete = a;
 		}
+		const float plafond = 32000.0f;
+		const float cible   = ( crete > plafond ) ? ( plafond / crete ) : 1.0f;
+		float fin;
+		int   rampe;
+		if( cible < s_limite )
+		{
+			fin   = cible;
+			rampe = 32;
+			++s_nb_limites;
+		}
+		else
+		{
+			fin = s_limite + ( 1.0f - s_limite ) * 0.07f;
+			if( fin > cible )
+				fin = cible;
+			rampe = s_grain;
+		}
+		const float depart = s_limite;
+		for( int i = 0; i < s_grain; ++i )
+		{
+			const float lim = ( i < rampe )
+			                  ? depart + ( fin - depart ) * (float)( i + 1 ) / (float)rampe
+			                  : fin;
+			for( int c = 0; c < SORTIE_CANAUX; ++c )
+			{
+				int e = (int)( accu[i * SORTIE_CANAUX + c] * lim );
+				if( e >  32767 )	e =  32767;
+				if( e < -32768 )	e = -32768;
+				s_melange[i * SORTIE_CANAUX + c] = (short)e;
+			}
+		}
+		s_limite = fin;
 
+		// Port deja vide a l'arrivee de ce grain alors qu'on jouait : le
+		// thread a ete en retard, il y a eu un trou -- un craquement qui
+		// n'est pas dans le melange. Compte pour le journal.
+		if( sortait && ( sceAudioOutGetRestSample( s_port ) == 0 ))
+			++s_nb_retards;
+
+		// Diagnostic #30 : temps de calcul du grain (trop lent ?) et ecart
+		// entre deux sorties (thread preempte ?).
+		const SceUInt64 t_avant = sceKernelGetProcessTimeWide();
+		if( sortait )
+		{
+			const unsigned int calcul = (unsigned int)( t_avant - t_sortie );
+			if( calcul > s_us_calcul_max )
+				s_us_calcul_max = calcul;
+		}
+		if( s_enreg && !s_enreg_plein )
+		{
+			int n = s_grain;
+			if( s_enreg_pos + n > s_enreg_max )
+				n = s_enreg_max - s_enreg_pos;
+			memcpy( s_enreg + s_enreg_pos * SORTIE_CANAUX, s_melange,
+			        n * SORTIE_CANAUX * sizeof( short ));
+			s_enreg_pos += n;
+			if( s_enreg_pos >= s_enreg_max )
+				s_enreg_plein = true;
+		}
 		sceAudioOutOutput( s_port, s_melange );
+		s_melange = ( s_melange == s_melange_base )
+		            ? s_melange_base + GRAIN * SORTIE_CANAUX : s_melange_base;
+		const SceUInt64 t_apres = sceKernelGetProcessTimeWide();
+		if( sortait )
+		{
+			const unsigned int ecart = (unsigned int)( t_apres - t_sortie );
+			if( ecart > s_us_ecart_max )
+				s_us_ecart_max = ecart;
+		}
+		t_sortie = t_apres;
+		sortait = true;
 	}
 	return 0;
 }
@@ -200,11 +452,13 @@ static int thread_mixeur( SceSize, void * )
 void InitSoundFX( CSfxManager * )
 {
 	memset( s_voix, 0, sizeof( s_voix ));
+	memset( s_fondus, 0, sizeof( s_fondus ));
 
 	// memalign et non malloc : la sortie audio de la Vita exige un tampon
 	// aligne. Un tampon mal aligne ne provoque pas d'erreur franche, juste
 	// du silence -- exactement le symptome le plus couteux a diagnostiquer.
-	s_melange = (short *)memalign( 64, GRAIN * SORTIE_CANAUX * sizeof( short ));
+	s_melange_base = (short *)memalign( 64, 2 * GRAIN * SORTIE_CANAUX * sizeof( short ));
+	s_melange = s_melange_base;
 	if( !s_melange )
 	{
 		VLOG( "SFX", "pas d'effets : allocation du tampon impossible" );
@@ -230,8 +484,14 @@ void InitSoundFX( CSfxManager * )
 	s_mutex = sceKernelCreateMutex( "thug_sfx", 0, 0, NULL );
 
 	s_tourne = true;
+	// Priorite 64 (la plus haute des threads utilisateur, celle du thread
+	// audio de SDL sur Vita) et non la priorite par defaut, partagee avec le
+	// thread principal : avec un grain de 512 echantillons on n'a que 10,7 ms
+	// de marge, et un thread audio qui attend son tour derriere le jeu laisse
+	// le port vide -- un craquement. Il passe l'essentiel de son temps bloque
+	// dans sceAudioOutOutput, et ne prend donc presque rien au jeu.
 	s_thread = sceKernelCreateThread( "thug_sfx", thread_mixeur,
-	                                  0x10000100, 0x10000, 0, 0, NULL );
+	                                  64, 0x10000, 0, 0, NULL );
 	if( s_thread >= 0 )
 	{
 		// Le retour est verifie : un demarrage refuse passerait sinon pour un
@@ -273,6 +533,9 @@ void CleanUpSoundFX( void )
 	// Les voix sont arretees (StopAllSoundFX) ; le verrou du mixeur garantit
 	// qu'aucune ne lit plus ces echantillons.
 	verrouille();
+	// Les fondus en cours lisent encore ces echantillons : on les coupe.
+	for( int f = 0; f < NUM_VOICES; ++f )
+		s_fondus[f].active = false;
 	for( int i = 0; i < NumWavesInTable; ++i )
 	{
 		PlatformWaveInfo *p_info = &( WaveTable[PERM_WAVE_TABLE_MAX_ENTRIES + i].platformWaveInfo );
@@ -492,7 +755,8 @@ int PlaySoundPlease( PlatformWaveInfo *pInfo, sVolume *p_vol, float pitch )
 
 	SVoix *p_v = &s_voix[v];
 	p_v->p_son    = pInfo->p_sound_data;
-	p_v->position = 0;
+	p_v->idx      = 0;
+	p_v->frac     = 0;
 	p_v->boucle   = pInfo->looping;
 	p_v->t_debut  = sceKernelGetProcessTimeWide();
 	p_v->signalee = false;
@@ -507,6 +771,9 @@ int PlaySoundPlease( PlatformWaveInfo *pInfo, sVolume *p_vol, float pitch )
 		p_v->pas = 1;
 
 	volumes_depuis( p_vol, &p_v->vol_g, &p_v->vol_d );
+	// Pas de rampe au demarrage : l'attaque d'un son doit rester franche.
+	p_v->gain_g = gain_effectif( p_v->vol_g, s_volume_global );
+	p_v->gain_d = gain_effectif( p_v->vol_d, s_volume_global );
 	p_v->active = true;
 
 	deverrouille();
@@ -519,7 +786,7 @@ void StopSoundPlease( int whichVoice )
 	if(( whichVoice < 0 ) || ( whichVoice >= NUM_VOICES ))
 		return;
 	verrouille();
-	s_voix[whichVoice].active = false;
+	arrete_voix( &s_voix[whichVoice] );
 	deverrouille();
 }
 
@@ -558,7 +825,7 @@ void StopAllSoundFX( void )
 {
 	verrouille();
 	for( int i = 0; i < NUM_VOICES; ++i )
-		s_voix[i].active = false;
+		arrete_voix( &s_voix[i] );
 	deverrouille();
 }
 
@@ -587,8 +854,56 @@ void SetReverbPlease( float, int, bool )	{}
 
 // Bilan des voix toutes les 10 s, seulement s'il change : sert a reperer un
 // son en boucle jamais arrete (#57).
+void VitaEnregistreMix( int secondes )
+{
+	if( s_enreg || ( secondes <= 0 ))
+		return;
+	s_enreg_max = secondes * SORTIE_HZ;
+	s_enreg = (short *)malloc( s_enreg_max * SORTIE_CANAUX * sizeof( short ));
+	if( !s_enreg )
+	{
+		VLOG( "SND", "mix : allocation de %d s impossible", secondes );
+		return;
+	}
+	s_enreg_pos   = 0;
+	s_enreg_plein = false;
+	VLOG( "SND", "mix : enregistrement de %d s de la sortie des effets", secondes );
+}
+
+static void ecrit_enregistrement( void )
+{
+	const int n = s_enreg_pos;
+	const unsigned int octets = n * SORTIE_CANAUX * sizeof( short );
+	unsigned char h[44];
+	unsigned int v;
+	memcpy( h, "RIFF", 4 );	v = 36 + octets;		memcpy( h + 4, &v, 4 );
+	memcpy( h + 8, "WAVEfmt ", 8 );	v = 16;			memcpy( h + 16, &v, 4 );
+	unsigned short w = 1;	memcpy( h + 20, &w, 2 );
+	w = SORTIE_CANAUX;		memcpy( h + 22, &w, 2 );
+	v = SORTIE_HZ;			memcpy( h + 24, &v, 4 );
+	v = SORTIE_HZ * SORTIE_CANAUX * 2;	memcpy( h + 28, &v, 4 );
+	w = SORTIE_CANAUX * 2;	memcpy( h + 32, &w, 2 );
+	w = 16;					memcpy( h + 34, &w, 2 );
+	memcpy( h + 36, "data", 4 );	memcpy( h + 40, &octets, 4 );
+	SceUID f = sceIoOpen( "ux0:data/thug/mix.wav",
+	                      SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777 );
+	if( f >= 0 )
+	{
+		sceIoWrite( f, h, 44 );
+		sceIoWrite( f, s_enreg, octets );
+		sceIoClose( f );
+	}
+	VLOG( "SND", "mix : %d echantillons ecrits dans ux0:data/thug/mix.wav (%s)",
+	      n, ( f >= 0 ) ? "ok" : "echec" );
+	short *p = s_enreg;
+	s_enreg = NULL;
+	free( p );
+}
+
 void PerFrameUpdate( void )
 {
+	if( s_enreg && s_enreg_plein )
+		ecrit_enregistrement();
 	static unsigned long long s_t = 0;
 	static int s_dernier = -1;
 	const unsigned long long t = sceKernelGetProcessTimeWide();
@@ -600,6 +915,29 @@ void PerFrameUpdate( void )
 		if( s_voix[i].active )
 		{
 			++actives;
+			// #19, #22 : un son PONCTUEL encore actif bien apres sa fin. C'etait
+			// le plouf (FallWater, 85376 echantillons) et le verre (HitGlassPane2x,
+			// 81088) de la v1.0.2 : la position 16.16 debordait a 65536
+			// echantillons et le son repartait du debut toutes les 1,49 s, voix
+			// jamais liberee jusqu'a StopAllSoundFX (pause, objectif relance,
+			// changement de niveau). Corrige en 1ff7bff ; le bilan ci-dessous ne
+			// regardait que les voix en boucle et ne pouvait pas le voir.
+			// Duree attendue au pas courant, marge 2 s (le pitch peut baisser).
+			if( !s_voix[i].boucle && !s_voix[i].signalee && s_voix[i].p_son
+			    && s_voix[i].pas )
+			{
+				const float duree = (float)s_voix[i].p_son->nb_echantillons * 65536.0f
+				                    / ( (float)s_voix[i].pas * (float)SORTIE_HZ );
+				const float age = (float)( t - s_voix[i].t_debut ) / 1000000.0f;
+				if( age > duree + 2.0f )
+				{
+					s_voix[i].signalee = true;
+					VLOG( "SND", "!! voix %d ponctuelle '%s' encore active apres %.1f s "
+					      "(duree attendue %.2f s, position %u/%d)", i,
+					      s_voix[i].p_son->nom, age, duree, s_voix[i].idx,
+					      s_voix[i].p_son->nb_echantillons );
+				}
+			}
 			if( s_voix[i].boucle )
 			{
 				++boucles;
@@ -617,6 +955,22 @@ void PerFrameUpdate( void )
 	{
 		s_dernier = actives * 1000 + boucles;
 		VLOG( "SND", "voix actives %d dont %d en boucle", actives, boucles );
+	}
+
+	// #26/#30 : retards du thread (trous dans la sortie) et interventions du
+	// limiteur, cumules depuis le lancement, seulement quand ils bougent.
+	static int s_retards_vus = 0, s_limites_vus = 0;
+	const int retards = s_nb_retards, limites = s_nb_limites;
+	if(( retards != s_retards_vus ) || ( limites != s_limites_vus ))
+	{
+		s_retards_vus = retards;
+		s_limites_vus = limites;
+		VLOG( "SND", "melange : %d retard(s) du port (trou = craquement), "
+		      "limiteur %d fois (gain %.2f) ; pire calcul %u us, pire ecart %u us "
+		      "(grain %d = %d us)", retards, limites, s_limite,
+		      s_us_calcul_max, s_us_ecart_max, s_grain, s_grain * 1000000 / SORTIE_HZ );
+		s_us_calcul_max = 0;
+		s_us_ecart_max  = 0;
 	}
 }
 

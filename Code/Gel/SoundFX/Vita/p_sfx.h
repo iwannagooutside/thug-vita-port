@@ -46,6 +46,8 @@ extern float	gSfxVolume;
 
 // #57 : liste les voix actives (nom, boucle, volumes, age) dans le journal.
 void	VitaListeVoix( void );
+// #30 : "mix N", enregistre N s de la sortie des effets (ux0:data/thug/mix.wav).
+void	VitaEnregistreMix( int secondes );
 
 void	InitSoundFX( CSfxManager *p_sfx_manager );
 void	CleanUpSoundFX( void );

@@ -35,8 +35,8 @@ namespace Sfx { struct sVolume; }
 #define EXTRA_CHANNEL		1
 #endif
 
-// Seul PCM_STATUS_FREE nous importe : c'est ce que GetStreamStatus rend
-// toujours, donc le moteur considère qu'aucun flux n'est occupé.
+// GetStreamStatus rend FREE (canal libre) ou RUNNING (voix en cours ou
+// préchargée, issue #20). music.cpp ne compare qu'à FREE et à LOADING.
 #define PCM_STATUS_FREE		0x00000000
 #define PCM_STATUS_IDLE		0x00000001
 #define PCM_STATUS_LOADING	0x00000002

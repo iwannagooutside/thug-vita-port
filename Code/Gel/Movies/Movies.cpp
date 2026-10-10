@@ -33,6 +33,8 @@
 #include <gel/movies/xbox/p_movies.h>
 #elif defined( __PLAT_NGC__ )
 #include <gel/movies/ngc/p_movies.h>
+#elif defined( __PLAT_VITA__ ) && defined( THUG_FMV )
+#include <gel/movies/Vita/p_movies.h>
 #endif
 
 #include <sys/profiler.h>
@@ -51,8 +53,13 @@ namespace Flx
 
 void PlayMovie( const char *pMovieName )
 {
+#if defined( __PLAT_VITA__ ) && defined( THUG_FMV )
+	// Vita : FFmpeg Bink (Gel/Movies/Vita, issue #3).
+	PMovies_PlayMovie( pMovieName );
+#else
 	return; // lwss: stubbed for now..
 	//PMovies_PlayMovie( pMovieName );
+#endif
 }
 
 }  // namespace Flx

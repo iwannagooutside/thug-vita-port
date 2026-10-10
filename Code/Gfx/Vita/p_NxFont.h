@@ -117,6 +117,11 @@ extern int g_vita_2d_glyphes;
 extern int g_vita_2d_appels_txt;
 void JournaliserTextes( void );
 
+// Issue #24 : textes Xbox des scripts (disque dur, console Xbox...) reecrits
+// pour la Vita. Rend une copie (malloc, a liberer par free) si au moins un
+// motif a ete remplace, NULL sinon. Appele par Gfx/2D/TextElement.cpp.
+char *TexteVitaSubstitue( const char *p_in );
+
 } // namespace NxVita
 
 #endif // __GFX_VITA_P_NXFONT_H__

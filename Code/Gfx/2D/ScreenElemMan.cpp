@@ -1128,6 +1128,25 @@ bool ScriptSetScreenElementProps(Script::CScriptStructure *pParams, Script::CScr
 {
 	CScreenElementManager* pManager = CScreenElementManager::Instance();
 	CScreenElementPtr p_elem = pManager->GetElement(pParams, CRCD(0x40c698af,"id"), CScreenElementManager::ASSERT);
+#ifdef __PLAT_VITA__
+	// Element absent : XBox n'y arrive pas (assert en debug), mais un script
+	// du port mal forme plantait ici sur un pointeur nul. On le dit et on
+	// continue (menu Vita Options, 2026-10-10).
+	if( !p_elem )
+	{
+		static int s_dit = 0;
+		if( s_dit < 20 )
+		{
+			++s_dit;
+			uint32 id = pManager->ResolveComplexID( pParams, CRCD(0x40c698af,"id") );
+			uint32 brut = 0;
+			pParams->GetChecksum( CRCD(0x40c698af,"id"), &brut );
+			VLOG( "QB", "!! SetScreenElementProps : element absent (id 0x%08x, brut 0x%08x) dans le script 0x%08x (base 0x%08x)",
+			      id, brut, pScript ? pScript->mScriptChecksum : 0, pScript ? pScript->GetBaseScript() : 0 );
+		}
+		return false;
+	}
+#endif
 			
 	p_elem->SetProperties(pParams);
 	

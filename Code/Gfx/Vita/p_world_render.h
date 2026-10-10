@@ -59,6 +59,8 @@ extern bool g_vita_zeq;		// test de profondeur du decor LEQUAL (XBox), « zeq »
 extern bool g_vita_alpha_test;
 extern bool g_vita_multitex;
 extern bool g_vita_id_debug;
+// Effacement violet (diagnostic) au lieu du gris-bleu XBox 0x506070 (#18, p_nx.cpp).
+extern bool g_vita_fond_violet;
 extern bool g_vita_sky_last;
 
 // scene >= 0 : limite aux maillages de cette scene (SceneMondeCourante), #65.

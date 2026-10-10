@@ -45,6 +45,11 @@
 
 char g_currentScriptFile[256]; // lwss add
 
+#ifdef __PLAT_VITA__
+// Sk/Scripting/Vita/vita_qb_options.cpp : menu VITA OPTIONS, .qb embarque.
+void VitaChargerQBOptions( void );
+#endif
+
 namespace SkateScript
 {
 using namespace Script;
@@ -136,6 +141,13 @@ void LoadAllStartupQBFiles()
 #endif		// __PLAT_NGC__
 
 	}	
+
+#ifdef __PLAT_VITA__
+	// Apres TOUS les .qb de qdir.txt (un symbole redefini remplace celui de
+	// qb.prx), avec le meme tas de chaines permanent. Verifie avant de
+	// charger ; en cas de doute, ne charge rien et le dit en [QB].
+	VitaChargerQBOptions();
+#endif
 
 	UseRegularStringHeap();
 	

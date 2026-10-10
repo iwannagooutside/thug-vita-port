@@ -17,6 +17,9 @@
 
 #ifdef __PLAT_VITA__
 #include "vita_log.h"
+#ifdef __PLAT_VITA__
+#include <psp2/io/stat.h>
+#endif
 #endif
 #include <sk/scripting/cfuncs.h>
 #include <sk/scripting/skfuncs.h>
@@ -9152,7 +9155,19 @@ bool ScriptSpawnScript(Script::CStruct *pParams, Script::CScript *pScript)
 	// sur XBox ce rechargement est cache derriere une video de plusieurs
 	// minutes. Sans decodeur Bink, il ne restait qu'un gel de ~1,3 s toutes
 	// les 30 s, ecran de chargement compris.
-	if( ScriptChecksum == CRCD(0x376be729,"attract_mode_timer") )
+	// Avec le lecteur FMV (#3), le mode demo revient comme sur XBox, sauf si
+	// les videos de demo manquent (dossier movies supprime par le joueur).
+	static int s_demo_ok = -1;
+	if( s_demo_ok < 0 )
+	{
+#ifdef THUG_FMV
+		SceIoStat st;
+		s_demo_ok = ( sceIoGetstat( "ux0:data/thug/Data/movies/bik/demo_1.bik", &st ) >= 0 ) ? 1 : 0;
+#else
+		s_demo_ok = 0;
+#endif
+	}
+	if( !s_demo_ok && ( ScriptChecksum == CRCD(0x376be729,"attract_mode_timer") ))
 	{
 		static bool s_dit = false;
 		if( !s_dit )

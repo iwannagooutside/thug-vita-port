@@ -39,6 +39,19 @@ void Manager::process_devices( const Tsk::Task< Manager::DeviceList >& task )
 }
 
 
+// Comme XBox/p_sioman.cpp:202 : lecture des manettes hors de la boucle de
+// taches, pour les boucles bloquantes (lecture des films, Gel/Movies/Vita).
+void Manager::ProcessDevices( void )
+{
+	Lst::Search< Device >	sh;
+	Device *device = sh.FirstItem( m_devices );
+	while( device )
+	{
+		device->process();
+		device = sh.NextItem();
+	}
+}
+
 Device *Manager::create_device( int index, int port, int slot )
 {
 	return new Device( index, port, slot );

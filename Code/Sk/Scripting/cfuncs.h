@@ -567,6 +567,12 @@ bool ScriptPreLoadStreamDone( Script::CStruct* pParams, Script::CScript* pScript
 bool ScriptStartPreLoadedStream( Script::CStruct* pParams, Script::CScript* pScript );
 bool ScriptFinishRendering( Script::CStruct* pParams, Script::CScript* pScript );
 
+#ifdef __PLAT_VITA__
+// Menu VITA OPTIONS du port (Sk/Scripting/Vita/vita_qb_options.cpp).
+bool ScriptVitaOptGet( Script::CStruct* pParams, Script::CScript* pScript );
+bool ScriptVitaOptToggle( Script::CStruct* pParams, Script::CScript* pScript );
+#endif
+
 /*****************************************************************************
 **								Inline Functions							**
 *****************************************************************************/

@@ -70,7 +70,7 @@ public :
 	void						Pause();
 	void						UnPause();
 	
-#	if defined( __PLAT_XBOX__ )
+#	if defined( __PLAT_XBOX__ ) || defined( __PLAT_VITA__ )
 	void						ProcessDevices();
 #	endif
 

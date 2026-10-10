@@ -59,6 +59,8 @@
 #include <gel/object/compositeobject.h>
 #ifdef __PLAT_VITA__
 #include <gel/components/modelcomponent.h>
+#include <gel/components/suspendcomponent.h>
+#include <gfx/nxmodel.h>
 namespace Nx { class CModel; void VitaRejouerModele( CModel * ); }
 #endif
 #include <gel/object/compositeobjectManager.h>
@@ -200,6 +202,47 @@ void CCompositeObject::Update()
 		return;
 	}
 
+#ifdef __PLAT_VITA__
+	// #28 : pietons qui n'apparaissent que tout pres (San Diego, missions).
+	//
+	// SuspendManager (SuspendComponent.cpp:548) suspend un objet au-dela de
+	// sa SuspendDistance -- pour les pietons de SD.qb, SuspendDistance = 0,
+	// donc lod_dist1 = 80 pieds (960 pouces). Suspendu, plus aucun composant
+	// n'est mis a jour (BC_NO_UPDATE), CModelComponent::Update compris. Mais
+	// le modele reste ACTIF jusqu'a lod_dist2 = 150 pieds (CheckModelActive,
+	// appele pour tous les objets, suspendus ou non) : XBox continue de
+	// dessiner son instance a chaque image avec la derniere matrice recue
+	// (XBox/p_NxGeom.cpp:493, plat_render ne fait que SetTransform), fige
+	// dans sa derniere pose. Sur Vita le dessin part de plat_render, appele
+	// par CModelComponent::Update : entre 80 et 150 pieds le pieton
+	// disparaissait. On rejoue donc sa derniere pose, comme pour CO_PAUSED.
+	//
+	// Seulement pour une suspension DE DISTANCE (SkipLogic) d'un modele actif
+	// (ni cache, ni au-dela de lod_dist2, ni vINVISIBLE) : les restes sans
+	// objet (ombres a l'origine, mainmenu_bg) ne passent pas ici. "rej 0"
+	// coupe aussi ce rejeu.
+	if( m_composite_object_flags.Test( CO_SUSPENDED ))
+	{
+		CSuspendComponent *p_sc = GetSuspendComponentFromObject( this );
+		CModelComponent   *p_mc = GetModelComponentFromObject( this );
+		if( p_sc && p_sc->SkipLogic() && p_mc && p_mc->GetModel() && p_mc->GetModel()->GetActive())
+		{
+			Nx::VitaRejouerModele( p_mc->GetModel());
+
+			// Combien de modeles suspendus redessines par image (cout du #28).
+			static unsigned  s_n = 0;
+			static SceUInt64 s_t = 0;
+			++s_n;
+			const SceUInt64 t = sceKernelGetProcessTimeWide();
+			if( t - s_t > 5000000 )
+			{
+				if( s_t )
+					VLOG( "MDL", "#28 rejeu des suspendus (distance) : %u modeles en 5 s", s_n );
+				s_t = t; s_n = 0;
+			}
+		}
+	}
+#endif
 
 	if (!m_composite_object_flags.Test(CO_SUSPENDED))
 	{

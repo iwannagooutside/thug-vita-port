@@ -653,6 +653,11 @@ SCFunction CFunctionLookupTable[]=
 	{"VibrationOff",			CFuncs::ScriptVibrationOff},
 	{"VibrationOn",				CFuncs::ScriptVibrationOn},
 	{"VibrateController",		CFuncs::ScriptVibrateController},
+#ifdef __PLAT_VITA__
+	// Menu VITA OPTIONS (vita/qb/vita_options.q, Sk/Scripting/Vita/vita_qb_options.cpp)
+	{"VitaOptGet",				CFuncs::ScriptVitaOptGet},
+	{"VitaOptToggle",			CFuncs::ScriptVitaOptToggle},
+#endif
 	{"EnableActuators",			CFuncs::ScriptEnableActuators},
 	{"AutoKickIsOn",			CFuncs::ScriptAutoKickIsOn},
 	{"AutoKickOn",				CFuncs::ScriptAutoKickOn},
