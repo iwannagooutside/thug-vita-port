@@ -12,6 +12,7 @@
 #include <core/defines.h>
 #include <sys/file/filesys.h>
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -324,6 +325,60 @@ const SVitaGlyph *CVitaFont::GetSpecialGlyph( int index ) const
 	return &mp_glyphs[i];
 }
 
+static void ps2_recolor_clut( unsigned char *clut )
+{
+	static const struct { float from, shift; } map[] = {
+		{   0.0f,  -35.0f },
+		{  55.0f,  165.0f },
+		{  64.0f,   70.0f },
+		{ 225.0f,  135.0f },
+	};
+
+	for( int i = 0; i < 256; ++i )
+	{
+		unsigned char *c = clut + i * 4;
+		float r = c[2] / 255.0f, g = c[1] / 255.0f, b = c[0] / 255.0f;
+		float mx = fmaxf( r, fmaxf( g, b )), mn = fminf( r, fminf( g, b ));
+		float d = mx - mn;
+		if(( mx < 0.05f ) || ( d / mx < 0.25f ))
+			continue;
+
+		float h;
+		if( mx == r )		h = 60.0f * fmodf(( g - b ) / d, 6.0f );
+		else if( mx == g )	h = 60.0f * (( b - r ) / d + 2.0f );
+		else				h = 60.0f * (( r - g ) / d + 4.0f );
+		if( h < 0.0f ) h += 360.0f;
+
+		int best = 0; float best_d = 999.0f;
+		for( int k = 0; k < 4; ++k )
+		{
+			float dd = fabsf( h - map[k].from );
+			if( dd > 180.0f ) dd = 360.0f - dd;
+			if( dd < best_d ) { best_d = dd; best = k; }
+		}
+		h = fmodf( h + map[best].shift + 360.0f, 360.0f );
+
+		float s = d / mx, v = mx;
+		float hh = h / 60.0f;
+		int   hi = (int)hh % 6;
+		float f  = hh - floorf( hh );
+		float p = v * ( 1.0f - s ), q = v * ( 1.0f - s * f ), t = v * ( 1.0f - s * ( 1.0f - f ));
+		float R, G, B;
+		switch( hi )
+		{
+			case 0: R = v; G = t; B = p; break;
+			case 1: R = q; G = v; B = p; break;
+			case 2: R = p; G = v; B = t; break;
+			case 3: R = p; G = q; B = v; break;
+			case 4: R = t; G = p; B = v; break;
+			default: R = v; G = p; B = q; break;
+		}
+		c[2] = (unsigned char)( R * 255.0f + 0.5f );
+		c[1] = (unsigned char)( G * 255.0f + 0.5f );
+		c[0] = (unsigned char)( B * 255.0f + 0.5f );
+	}
+}
+
 
 bool CVitaFont::plat_load( const char *filename )
 {
@@ -409,6 +464,8 @@ bool CVitaFont::plat_load( const char *filename )
 	}
 	File::Read( p_idx, num_bytes, 1, p_file );
 	File::Read( clut, 1024, 1, p_file );
+	if( strncmp( filename, "Buttons", 7 ) == 0 )
+		ps2_recolor_clut( clut );
 
 	// Palette : octets R, G, B, A dans le fichier, et alpha double. Les alphas
 	// du moteur plafonnent a 0x80 (heritage PS2) ; sans ce doublement, tout le
@@ -809,10 +866,10 @@ void RenderText2D( float pri )
 			// reference (DX9/NX/chars.cpp:858, identique cote XBox).
 			//
 			// [CORRIGE] la formule precedente omettait DefaultBase et ne
-			// gardait que « - baseline ». L'ecart est une CONSTANTE, donc
+			// gardait que ï¿½ - baseline ï¿½. L'ecart est une CONSTANTE, donc
 			// invisible sur le texte seul : tout le texte remontait ensemble.
 			// Cela se voyait en revanche par rapport aux elements voisins,
-			// soulignement et icones, qui paraissaient « en dessous » alors
+			// soulignement et icones, qui paraissaient ï¿½ en dessous ï¿½ alors
 			// que c'est le texte qui etait trop haut.
 			//
 			// DefaultBase est la ligne de base commune de la fonte ; baseline
